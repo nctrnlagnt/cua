@@ -995,6 +995,15 @@ fn chromium_family_program(program: &str) -> bool {
 /// (via `xid_hint` or the first window for `pid`), then converts screen-absolute
 /// → window-local coords via compositor metadata on Wayland or
 /// XTranslateCoordinates on X11.
+///
+/// **Known scaling gap.** Under KDE fractional scaling with a Qt target, AT-SPI
+/// `CoordType::Screen` extents are logical while `x11_window_origin` (the
+/// XTranslateCoordinates offset subtracted below) is physical. The arithmetic
+/// mixes coordinate spaces, so the click injected from these local coords can
+/// miss by `(scale - 1) × window_origin_distance`. `element_screen_center` is
+/// scaled for the overlay glow, but this click path is NOT — applying the same
+/// factor here unconditionally would regress GTK-on-X11 (whose bounds are
+/// already physical). Needs per-toolkit detection to fix correctly.
 fn resolve_element_local_coords(
     pid: u32,
     idx: usize,
@@ -1049,7 +1058,11 @@ fn resolve_element_local_coords(
 
 fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
     let (bx, by, bw, bh) = crate::atspi::get_element_bounds(pid, idx)?;
-    Ok((bx as f64 + bw as f64 / 2.0, by as f64 + bh as f64 / 2.0))
+    let scale = desktop_scale_factor();
+    Ok((
+        (bx as f64 + bw as f64 / 2.0) * scale,
+        (by as f64 + bh as f64 / 2.0) * scale,
+    ))
 }
 
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
@@ -1596,6 +1609,109 @@ fn process_name(pid: u32) -> Option<String> {
         .lines()
         .find(|l| l.starts_with("Name:"))
         .map(|l| l[5..].trim().to_owned())
+}
+
+/// Detect the active desktop scale factor for converting AT-SPI logical
+/// coordinates to physical screen pixels, so the cursor overlay glow lands on
+/// the right element under fractional scaling.
+///
+/// **Scope and known limitation.** This is tuned for the reported bug:
+/// Qt apps under KDE with `QT_SCREEN_SCALE_FACTORS` set, where Qt's AT-SPI
+/// bridge reports `CoordType::Screen` extents in logical units. GTK apps on
+/// X11 take a different `get_element_bounds` path (`CoordType::Window` +
+/// XTranslateCoordinates + `_GTK_FRAME_EXTENTS`) that already yields physical
+/// pixels — so applying this factor to a GTK app in the same scaled session
+/// will overshoot the glow by `(scale - 1) × distance`. The glow is cosmetic;
+/// the real click path (`resolve_element_local_coords`) is unaffected. A
+/// proper fix needs per-toolkit detection; this helper is a targeted workaround.
+///
+/// Resolution order — first value `> 1.0` wins, otherwise the next source is
+/// tried (so an unset/1.0 Qt var still lets GDK or kdeglobals speak):
+/// 1. `QT_SCREEN_SCALE_FACTORS` env (per-output; take the first value)
+/// 2. `QT_SCALE_FACTOR` env (Qt global)
+/// 3. `GDK_SCALE` env (GTK global integer scale)
+/// 4. `$XDG_CONFIG_HOME/kdeglobals` or `~/.config/kdeglobals` `[KScreen] ScaleFactor`
+/// 5. Default `1.0` (no scaling detected)
+///
+/// GNOME fractional scaling and per-output `kscreen` EDO JSON are not covered.
+/// Cached for the process lifetime — desktop scale doesn't change mid-session
+/// and this sits on the hot AX-click path.
+fn desktop_scale_factor() -> f64 {
+    static CACHE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(detect_scale_factor)
+}
+
+fn detect_scale_factor() -> f64 {
+    // Qt per-screen: "eDP-1=1.75;DP-1=1.75;..." — take the first value.
+    if let Ok(qt_factors) = std::env::var("QT_SCREEN_SCALE_FACTORS") {
+        if let Some(factor) = parse_qt_screen_factors(&qt_factors) {
+            return factor;
+        }
+    }
+    // Qt global scale (not per-screen).
+    if let Ok(factor_str) = std::env::var("QT_SCALE_FACTOR") {
+        if let Some(factor) = parse_scale_gt1(&factor_str) {
+            return factor;
+        }
+    }
+    // GTK global scale (integer-only on X11).
+    if let Ok(scale_str) = std::env::var("GDK_SCALE") {
+        if let Some(factor) = parse_scale_gt1(&scale_str) {
+            return factor;
+        }
+    }
+    // KDE config: kdeglobals [KScreen] ScaleFactor. Read the file directly —
+    // spawning kreadconfig5/6 per click is too expensive for the hot path.
+    // Honor XDG_CONFIG_HOME per the XDG base-dir spec.
+    let kdeglobals = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty()) {
+        std::path::PathBuf::from(xdg).join("kdeglobals")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(home).join(".config/kdeglobals")
+    } else {
+        // No HOME, no XDG — nothing to read.
+        return 1.0;
+    };
+    if let Ok(contents) = std::fs::read_to_string(&kdeglobals) {
+        if let Some(factor) = parse_kdeglobals_scalefactor(&contents) {
+            return factor;
+        }
+    }
+    1.0
+}
+
+/// Parse `s` as f64 and return it only when it's a meaningful scale (> 1.0).
+fn parse_scale_gt1(s: &str) -> Option<f64> {
+    s.trim().parse::<f64>().ok().filter(|&f| f > 1.0)
+}
+
+/// Take the first per-output value from a `QT_SCREEN_SCALE_FACTORS` string
+/// ("eDP-1=1.75;DP-1=2.0" → 1.75). Accepts both `name=value` and bare-value
+/// forms. Returns `None` when the first value is missing, unparseable, or ≤ 1.0.
+fn parse_qt_screen_factors(s: &str) -> Option<f64> {
+    let first = s.split(';').next()?;
+    let val = first.split('=').last()?;
+    parse_scale_gt1(val)
+}
+
+/// Read `ScaleFactor=` from the `[KScreen]` section of a kdeglobals file.
+/// Returns `None` when absent, unparseable, or ≤ 1.0.
+fn parse_kdeglobals_scalefactor(contents: &str) -> Option<f64> {
+    let mut in_kscreen = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_kscreen = trimmed == "[KScreen]";
+            continue;
+        }
+        if in_kscreen {
+            if let Some(val) = trimmed.strip_prefix("ScaleFactor=") {
+                if let Some(factor) = parse_scale_gt1(val) {
+                    return Some(factor);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_terminal_process(pid: u32) -> bool {
@@ -7171,5 +7287,90 @@ mod browser_launch_guard_tests {
         assert!(!contains_remote_debugging_flag(
             "--user-data-dir=/tmp/profile"
         ));
+    }
+}
+
+#[cfg(test)]
+mod scale_factor_tests {
+    use super::*;
+
+    #[test]
+    fn parse_scale_gt1_accepts_above_one() {
+        assert_eq!(parse_scale_gt1("1.75"), Some(1.75));
+        assert_eq!(parse_scale_gt1("  2 "), Some(2.0));
+        assert_eq!(parse_scale_gt1("1.0"), None);
+        assert_eq!(parse_scale_gt1("0.5"), None);
+        assert_eq!(parse_scale_gt1(""), None);
+        assert_eq!(parse_scale_gt1("auto"), None);
+    }
+
+    #[test]
+    fn qt_screen_factors_name_equals_value_form() {
+        // Real-world KDE: per-output factors separated by ';'.
+        assert_eq!(
+            parse_qt_screen_factors("eDP-1=1.75;DP-1=1.75"),
+            Some(1.75)
+        );
+    }
+
+    #[test]
+    fn qt_screen_factors_bare_value_form() {
+        // Single global value, no name prefix.
+        assert_eq!(parse_qt_screen_factors("1.5"), Some(1.5));
+    }
+
+    #[test]
+    fn qt_screen_factors_first_value_at_one_falls_through() {
+        // Mixed-DPI: first output is 1.0, second is 2.0. Documented behavior
+        // is "first value > 1.0 wins, else None" — the caller then tries the
+        // next detection source. We do NOT silently grab the second output.
+        assert_eq!(parse_qt_screen_factors("eDP-1=1.0;DP-1=2.0"), None);
+    }
+
+    #[test]
+    fn qt_screen_factors_rejects_garbage() {
+        assert_eq!(parse_qt_screen_factors(""), None);
+        assert_eq!(parse_qt_screen_factors("eDP-1=auto;DP-1=2.0"), None);
+    }
+
+    #[test]
+    fn kdeglobals_reads_kscreen_section() {
+        let contents = "\
+[General]
+ColorScheme=Breeze
+
+[KScreen]
+ScaleFactor=1.75
+
+[Icons]
+Theme=breeze
+";
+        assert_eq!(parse_kdeglobals_scalefactor(contents), Some(1.75));
+    }
+
+    #[test]
+    fn kdeglobals_ignores_scalefactor_outside_kscreen() {
+        // A stray `ScaleFactor=` in another section must not match.
+        let contents = "\
+[General]
+ScaleFactor=2.0
+
+[KScreen]
+ScaleFactor=1.5
+";
+        assert_eq!(parse_kdeglobals_scalefactor(contents), Some(1.5));
+    }
+
+    #[test]
+    fn kdeglobals_returns_none_when_section_or_key_absent() {
+        assert_eq!(parse_kdeglobals_scalefactor("[General]\nColorScheme=X\n"), None);
+        assert_eq!(parse_kdeglobals_scalefactor("[KScreen]\n"), None);
+        assert_eq!(parse_kdeglobals_scalefactor(""), None);
+    }
+
+    #[test]
+    fn kdeglobals_returns_none_when_value_le_one() {
+        let contents = "[KScreen]\nScaleFactor=1.0\n";
+        assert_eq!(parse_kdeglobals_scalefactor(contents), None);
     }
 }
