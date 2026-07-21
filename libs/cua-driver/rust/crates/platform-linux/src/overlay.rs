@@ -136,25 +136,32 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
     });
     // On Wayland sessions that use the native layer-shell overlay (KDE,
     // wlroots compositors — anything with zwlr_layer_shell_v1 and no
-    // shell_helper), suppress the X11 overlay broadcast entirely. Both
-    // overlays would receive the same coordinates, but they have
-    // incompatible scale expectations: the X11 overlay paints at
-    // backing_scale=1.0 in a physical pixmap (expects pre-multiplied
-    // coords), while the layer-shell overlay passes the real output
-    // scale as backing_scale (expects logical coords). Broadcasting to
-    // both produces a wrong invisible cursor under the correct visible
-    // one. GNOME (shell_helper) still gets both — its X11 overlay is
-    // inert under mutter and shell_helper handles the visible cursor.
+    // shell_helper), suppress the X11 paint path. Both overlays would
+    // receive the same coordinates, but they have incompatible scale
+    // expectations: the X11 overlay paints at backing_scale=1.0 in a
+    // physical pixmap (expects pre-multiplied coords), while the
+    // layer-shell overlay passes the real output scale as backing_scale
+    // (expects logical coords). Broadcasting paint to both produces a
+    // wrong invisible cursor under the correct visible one.
+    //
+    // Still apply the command into the shared RENDER map so
+    // is_enabled_for / current_position_for / seed_start_if_sentinel see
+    // SetEnabled and position updates — those readers do not go through
+    // the X11 owner thread.
     #[cfg(target_os = "linux")]
     let skip_x11 = crate::wayland::is_wayland()
         && !crate::wayland::shell_helper::available();
     #[cfg(not(target_os = "linux"))]
     let skip_x11 = false;
 
-    if !skip_x11 {
-        if let Some(tx) = CMD_TX.get() {
-            let _ = tx.try_send(msg.clone());
+    if skip_x11 {
+        if let Ok(mut guard) = RENDER.lock() {
+            if let Some(map) = guard.as_mut() {
+                let _ = apply_msg(map, msg.clone());
+            }
         }
+    } else if let Some(tx) = CMD_TX.get() {
+        let _ = tx.try_send(msg.clone());
     }
     // Also forward to the native-Wayland layer-shell overlay when Wayland
     // is opted in. The wayland overlay's `forward` is a no-op when its
@@ -279,6 +286,44 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
         }
     };
     if !should_animate {
+        return;
+    }
+
+    // Layer-shell Wayland path: the X11 owner thread never runs, so the
+    // arrival oneshot registered below would never fire and this await would
+    // hang until the tool times out. Sleep for the configured glide duration
+    // (or a short default) while the Wayland overlay thread animates.
+    #[cfg(target_os = "linux")]
+    let skip_x11_arrival = crate::wayland::is_wayland()
+        && !crate::wayland::shell_helper::available();
+    #[cfg(not(target_os = "linux"))]
+    let skip_x11_arrival = false;
+
+    if skip_x11_arrival {
+        let wait_ms = {
+            let guard = RENDER.lock().unwrap();
+            guard
+                .as_ref()
+                .and_then(|m| m.cursors.get(&key))
+                .map(|rs| {
+                    let d = rs.core.motion.glide_duration_ms;
+                    if d > 0.0 {
+                        d as u64
+                    } else {
+                        350
+                    }
+                })
+                .unwrap_or(350)
+        };
+        send_command_for(
+            key,
+            OverlayCommand::MoveTo {
+                x,
+                y,
+                end_heading_radians: std::f64::consts::FRAC_PI_4,
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
         return;
     }
 
@@ -1414,7 +1459,11 @@ mod tests {
         assert!(arrived.is_empty());
         assert!(had_msg);
         let cursor = &map.cursors["default"].core;
-        assert_eq!(cursor.pos, (40.0, 50.0));
+        // ClickPulse applies the same 16pt tip offset as MoveTo (FRAC_PI_4).
+        let angle = std::f64::consts::FRAC_PI_4;
+        let expected = (40.0 + angle.cos() * 16.0, 50.0 + angle.sin() * 16.0);
+        assert!((cursor.pos.0 - expected.0).abs() < 1e-9);
+        assert!((cursor.pos.1 - expected.1).abs() < 1e-9);
         assert_eq!(cursor.click_t, Some(0.0));
     }
 

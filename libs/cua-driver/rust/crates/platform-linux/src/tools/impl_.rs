@@ -1598,11 +1598,14 @@ async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
     }
     let pos = crate::overlay::current_position_for(cursor_id);
     if pos.0 < 0.0 && pos.1 < 0.0 {
+        // First placement: seed with ClickPulse so the cursor appears, then
+        // still animate to the target. Returning early left the cursor stuck
+        // at the seed point on Wayland (no X11 arrival path to finish the
+        // move).
         crate::overlay::send_command_for(
             cursor_id.to_owned(),
             cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
         );
-        return;
     }
     crate::overlay::animate_cursor_to_for(cursor_id.to_owned(), sx, sy).await;
 }

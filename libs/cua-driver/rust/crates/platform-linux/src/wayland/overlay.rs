@@ -350,6 +350,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
     loop {
         // Drain all pending commands without blocking.
         let mut shutdown = false;
+        let mut had_cmd = false;
         loop {
             match rx.try_recv() {
                 Ok(WlOverlayCmd::Shutdown) => {
@@ -357,6 +358,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
                     break;
                 }
                 Ok(WlOverlayCmd::Cmd { cmd }) => {
+                    had_cmd = true;
                     // Seed: if the cursor is still at the off-screen sentinel
                     // `(-200, -200)` from `RenderStateCore::new`, snap to a
                     // point near the MoveTo / SnapTo target so the spring
@@ -387,6 +389,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
                     // Single-cursor overlay: removing the active cursor
                     // hides it. Multi-cursor wlroots support can layer on
                     // top of this in a follow-up if needed.
+                    had_cmd = true;
                     state.core.visible = false;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
@@ -400,13 +403,36 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
             break;
         }
 
-        // Tick animation forward and repaint if anything changed.
+        // Tick animation forward and repaint only when pixels can change.
+        // Unconditional 60Hz full-screen shm commits exhaust memfds (EMFILE)
+        // and kill the owner thread under sustained idle.
         let now = Instant::now();
         let dt = now.duration_since(last_tick).as_secs_f64().min(0.05);
         last_tick = now;
-        state.core.tick_motion(dt);
-        if state.configured {
-            redraw(&mut state, &shm, &qh)?;
+        let arrived = state.core.tick_motion(dt);
+        let needs_frame = arrived
+            || state.core.path.is_some()
+            || state.core.spring.is_some()
+            || state.core.click_t.is_some()
+            || state.core.idle_alpha < 0.999
+            || had_cmd;
+        if state.configured && needs_frame {
+            // Cap in-flight shm buffers so a slow compositor cannot pin
+            // unbounded memfds open (EMFILE on the owner thread).
+            const MAX_PENDING: usize = 3;
+            while state.pending_buffers.len() >= MAX_PENDING {
+                queue.dispatch_pending(&mut state)?;
+                if state.pending_buffers.len() >= MAX_PENDING {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    queue.dispatch_pending(&mut state)?;
+                    if state.pending_buffers.len() >= MAX_PENDING {
+                        break;
+                    }
+                }
+            }
+            if state.pending_buffers.len() < MAX_PENDING {
+                redraw(&mut state, &shm, &qh)?;
+            }
         }
         queue.dispatch_pending(&mut state)?;
 

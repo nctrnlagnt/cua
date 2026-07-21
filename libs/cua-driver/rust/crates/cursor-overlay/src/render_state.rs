@@ -432,20 +432,24 @@ impl RenderStateCore {
                 true
             }
             OverlayCommand::ClickPulse { x, y } => {
+                // MoveTo plans to click + 16pt along end_heading so the arrow
+                // tip (not the bloom center at core.pos) sits on the click
+                // point. ClickPulse must apply the same offset or the settle
+                // snap after a glide pulls the tip 16pt off the target.
+                const CLICK_OFFSET: f64 = 16.0;
+                let angle = std::f64::consts::FRAC_PI_4;
+                let tip_pos = (
+                    x + angle.cos() * CLICK_OFFSET,
+                    y + angle.sin() * CLICK_OFFSET,
+                );
                 if click_pulse_sentinel_only {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
                     if self.pos.0 < -50.0 {
-                        // Apply same click offset so tip lands at click point.
-                        const CLICK_OFFSET: f64 = 16.0;
-                        let angle = std::f64::consts::FRAC_PI_4;
-                        self.pos = (
-                            x + angle.cos() * CLICK_OFFSET,
-                            y + angle.sin() * CLICK_OFFSET,
-                        );
+                        self.pos = tip_pos;
                     }
                 } else {
-                    self.pos = (x, y);
+                    self.pos = tip_pos;
                 }
                 self.click_t = Some(0.0);
                 self.idle_secs = 0.0;
