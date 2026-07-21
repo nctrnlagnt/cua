@@ -957,12 +957,23 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
             }
         }
         // Tier 4: xdg-desktop-portal (GNOME, KDE, COSMIC fallback).
-        match portal_screenshot::screenshot_via_portal() {
+        // Bound hard: after a libei/RemoteDesktop click the portal path can
+        // hang indefinitely on KWin (observed on Plasma 6). Prefer failing
+        // over to spectacle/X11 rather than blocking the tool for 20-45s.
+        match screenshot_via_portal_bounded(std::time::Duration::from_secs(3)) {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
                 tracing::debug!(
-                    "xdg-desktop-portal Screenshot unavailable ({e}); falling through to X11"
+                    "xdg-desktop-portal Screenshot unavailable ({e}); trying spectacle/X11"
                 );
+            }
+        }
+        // Tier 5: KDE spectacle CLI — reliable when the portal is wedged
+        // after RemoteDesktop input (common on the computer-use hot path).
+        match screenshot_via_spectacle() {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                tracing::debug!("spectacle screenshot unavailable ({e}); falling through to X11");
             }
         }
     }
@@ -970,6 +981,58 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
     // so we don't re-enter screenshot_display_bytes (which routes back here
     // on Wayland — would loop forever).
     crate::capture::screenshot_display_bytes_x11()
+}
+
+/// Run the ashpd portal screenshot on a worker thread with a hard deadline.
+fn screenshot_via_portal_bounded(limit: std::time::Duration) -> anyhow::Result<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("cua-portal-shot".into())
+        .spawn(move || {
+            let _ = tx.send(portal_screenshot::screenshot_via_portal());
+        })
+        .map_err(|e| anyhow::anyhow!("spawn portal screenshot worker: {e}"))?;
+    match rx.recv_timeout(limit) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!("xdg-desktop-portal Screenshot timed out after {limit:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("xdg-desktop-portal Screenshot worker exited without a result")
+        }
+    }
+}
+
+/// KDE Spectacle non-interactive full-screen grab (`spectacle -b -n -o`).
+fn screenshot_via_spectacle() -> anyhow::Result<Vec<u8>> {
+    let path = std::env::temp_dir().join(format!(
+        "cua-spectacle-{}.png",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let out = std::process::Command::new("spectacle")
+        .args(["-b", "-n", "-o"])
+        .arg(&path)
+        .output()
+        .map_err(|e| anyhow::anyhow!("spectacle spawn failed: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&path);
+        anyhow::bail!(
+            "spectacle exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let bytes = std::fs::read(&path).map_err(|e| {
+        anyhow::anyhow!("spectacle wrote no readable PNG at {}: {e}", path.display())
+    })?;
+    let _ = std::fs::remove_file(&path);
+    if bytes.is_empty() {
+        anyhow::bail!("spectacle produced empty PNG");
+    }
+    Ok(bytes)
 }
 
 /// Per-window capture dispatcher. On X11 forwards to the existing window
@@ -2090,8 +2153,8 @@ fn libei_drag(
 ) -> anyhow::Result<()> {
     // ei_button exposes separate Press/Released states, so the libei worker can
     // hold the button across the interpolated motion — a genuine
-    // press→move→release drag. Clamp both endpoints to the output — but NOT via
-    // `normalize_click_xy`, whose (0,0)→centre convention (for coordinate-free
+    // press->move->release drag. Clamp both endpoints to the output — but NOT via
+    // `normalize_click_xy`, whose (0,0)->centre convention (for coordinate-free
     // clicks) is wrong here: a drag endpoint is always explicit and (0,0) is a
     // valid top-left corner target.
     let btn = cua_button_to_libei(button);

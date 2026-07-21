@@ -457,14 +457,23 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
             // unbounded memfds open (EMFILE on the owner thread).
             const MAX_PENDING: usize = 3;
             while state.pending_buffers.len() >= MAX_PENDING {
-                // Never let a dispatch error kill the owner thread — a dead
-                // overlay thread means no cursor for the rest of the process.
+                // Drain events (including buffer releases) non-blocking so
+                // the compositor can free pending shm slots. prepare_read +
+                // read reads from the socket without a sync round-trip.
+                let _ = conn.flush();
+                if let Some(guard) = queue.prepare_read() {
+                    let _ = guard.read();
+                }
                 if let Err(e) = queue.dispatch_pending(&mut state) {
                     tracing::warn!("cua-overlay-wl dispatch_pending: {e}");
                     break;
                 }
                 if state.pending_buffers.len() >= MAX_PENDING {
                     std::thread::sleep(std::time::Duration::from_millis(1));
+                    let _ = conn.flush();
+                    if let Some(guard) = queue.prepare_read() {
+                        let _ = guard.read();
+                    }
                     if let Err(e) = queue.dispatch_pending(&mut state) {
                         tracing::warn!("cua-overlay-wl dispatch_pending: {e}");
                         break;
@@ -485,8 +494,40 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
                 }
             }
         }
-        if let Err(e) = queue.dispatch_pending(&mut state) {
-            tracing::warn!("cua-overlay-wl dispatch_pending: {e}");
+        // CRITICAL: dispatch_pending alone does NOT read from the Wayland
+        // socket — it only dispatches events already read into the queue.
+        // Without reading the socket, buffer releases, reconfigure events,
+        // and frame callbacks pile up in the kernel socket buffer unprocessed.
+        // KWin withholds compositing until a reconfigure ack arrives, and
+        // the pending buffer cap chokes the redraw path.
+        //
+        // roundtrip() fixes the socket-read problem but BLOCKS on a
+        // wl_display.sync round-trip — if the compositor is slow to reply
+        // (e.g. busy compositing a fullscreen layer surface), the loop
+        // stalls and channel commands pile up, freezing the cursor.
+        //
+        // The correct pattern is prepare_read + read: this reads any
+        // events sitting in the socket buffer WITHOUT blocking or sending
+        // a sync request. Combined with conn.flush() to push our own
+        // requests out, this keeps the event queue drained at 60Hz without
+        // ever blocking the animation loop.
+        let _ = conn.flush();
+        if let Some(guard) = queue.prepare_read() {
+            match guard.read() {
+                Ok(_) => {
+                    if let Err(e) = queue.dispatch_pending(&mut state) {
+                        tracing::warn!("cua-overlay-wl dispatch_pending: {e}");
+                    }
+                }
+                Err(e) => {
+                    // WouldBlock = no events on socket (normal at 60Hz);
+                    // anything else is a protocol fault worth logging.
+                    let msg = e.to_string();
+                    if !msg.contains("WouldBlock") {
+                        tracing::warn!("cua-overlay-wl read: {msg}");
+                    }
+                }
+            }
         }
 
         // Sleep for the remainder of the frame budget so the loop doesn't
