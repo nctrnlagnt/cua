@@ -2470,11 +2470,6 @@ impl Tool for TypeTextTool {
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
         }
-        if resolved_elem_idx.is_none() {
-            if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
-                return refusal;
-            }
-        }
 
         let px = args.get("x").and_then(|value| value.as_f64());
         let py = args.get("y").and_then(|value| value.as_f64());
@@ -2488,10 +2483,44 @@ impl Tool for TypeTextTool {
         }
 
         let text_len = text.chars().count();
-        // Native toolkit editables have a stronger focus-free route than raw
-        // compositor keyboard injection. Keep Chromium/WebKit on real key events
-        // because their accessibility bridges may echo a write that never reaches
-        // renderer-owned state.
+
+        // ── Focus-free AT-SPI EditableText (primary Wayland route) ──────────
+        // On Plasma/KWin, wtype's zwp_virtual_keyboard is unavailable and
+        // foreign-toplevel activate is not exposed, so the old path refused
+        // background typing and failed foreground activation. Native toolkits
+        // (Qt/GTK/KCalc, etc.) still accept EditableText.insertText without
+        // compositor focus — try that before any FocusedInputOnly refusal.
+        // Chromium/WebKit keep their key-event path (AT-SPI can echo without
+        // updating renderer state).
+        if !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid) && px.is_none() {
+            let text_ax = text.clone();
+            let ax = tokio::task::spawn_blocking(move || {
+                if let Some(idx) = resolved_elem_idx {
+                    crate::atspi::type_into_editable_at(pid, idx, &text_ax)
+                } else {
+                    crate::atspi::type_into_editable(pid, &text_ax)
+                }
+            })
+            .await;
+            if let Ok(Ok(())) = ax {
+                let route = if resolved_elem_idx.is_some() {
+                    "via targeted AT-SPI"
+                } else {
+                    "via AT-SPI"
+                };
+                return type_text_ax_confirm_result(pid, text_len, route);
+            }
+        }
+
+        // No focus-free path left for this call shape — refuse background on
+        // plain Wayland (keys only reach the globally focused surface).
+        if resolved_elem_idx.is_none() && px.is_none() {
+            if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
+                return refusal;
+            }
+        }
+
+        // Nested cua-compositor: focus-free inject after optional AT-SPI miss.
         if crate::wayland::is_inject_mode()
             && resolved_elem_idx.is_some()
             && !is_chromium_embedder(pid)

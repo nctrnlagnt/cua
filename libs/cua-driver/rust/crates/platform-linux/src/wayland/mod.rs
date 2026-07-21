@@ -1255,6 +1255,15 @@ pub fn activate_window_for_input_target(
         return Ok(());
     }
 
+    // KWin/Plasma: foreign-toplevel activate is unavailable, but workspace
+    // scripting can raise a window by pid (same DBus path as geometry dump).
+    if let Some(pid) = target_pid {
+        if kwin_activate_pid(pid) {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            return Ok(());
+        }
+    }
+
     anyhow::bail!(
         "foreground_unavailable: this Wayland compositor does not expose a verified, \
          target-addressable activation adapter for window {window_id}; refusing global \
@@ -1579,6 +1588,51 @@ fn kwin_window_geometry_uncached(pid: u32, title: Option<&str>) -> Option<(i32, 
 /// `window_to_screen_offset` so AT-SPI clicks skip `list_windows_dispatch`.
 pub fn kwin_window_origin(pid: u32) -> Option<(i32, i32)> {
     kwin_window_geometry(pid, None).map(|(x, y, _, _)| (x, y))
+}
+
+/// Raise/focus a KWin toplevel by pid via a one-shot scripting call.
+///
+/// Used when `zwlr_foreign_toplevel` activate and the GNOME WinRects helper
+/// are unavailable so foreground libei/wtype typing can target the right app.
+/// Returns true when the script was loaded and run (KWin does not report
+/// success of the focus change itself).
+fn kwin_activate_pid(pid: u32) -> bool {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos(),
+        Err(_) => return false,
+    };
+    let script_name = format!("cua-kwin-act-{token}");
+    let script_path = format!("/tmp/{script_name}.js");
+    // Prefer the most recently stacked matching window (last in list often
+    // is not the active one; workspace.activeWindow assignment is enough).
+    let script = format!(
+        r#"var windows = workspace.windowList();
+for (var i = 0; i < windows.length; i++) {{
+    var w = windows[i];
+    if (w.pid === {pid}) {{
+        workspace.activeWindow = w;
+        break;
+    }}
+}}
+"#
+    );
+    if std::fs::File::create(&script_path)
+        .and_then(|mut f| f.write_all(script.as_bytes()))
+        .is_err()
+    {
+        return false;
+    }
+    let Some(script_id) = kwin_load_script(&script_path, &script_name) else {
+        let _ = std::fs::remove_file(&script_path);
+        return false;
+    };
+    kwin_run_script(script_id);
+    kwin_unload_script(&script_name);
+    let _ = std::fs::remove_file(&script_path);
+    true
 }
 
 fn kwin_cached_uuid(pid: u32, title: Option<&str>) -> Option<String> {
