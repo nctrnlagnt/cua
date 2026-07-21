@@ -133,10 +133,17 @@ struct OverlayState {
     /// event. The wl_shm buffer is allocated at `surface_w × scale` physical
     /// pixels (see `output_scale`); a `wp_viewport` maps that buffer back to
     /// this logical size so the compositor places it correctly on a HiDPI
-    /// output. Populated ONLY by `ZwlrLayerSurfaceV1::Configure` — never by
-    /// `wl_output::Mode`, which reports physical screen pixels.
+    /// output. Populated only by `ZwlrLayerSurfaceV1::Configure` when the
+    /// compositor sends a non-zero size. Anchored full-screen surfaces often
+    /// get Configure(0,0) — then `mode_w/h ÷ scale` is the fallback.
     surface_w: u32,
     surface_h: u32,
+    /// Physical screen pixels from `wl_output::Mode`. Used only as a fallback
+    /// when Configure leaves surface dims at 0 (anchor-all + set_size(0,0)).
+    /// Kept separate from `surface_w/h` so a later Mode event cannot overwrite
+    /// a real logical Configure size.
+    mode_w: u32,
+    mode_h: u32,
     /// Effective output scale (logical→physical). Driven by
     /// `wp_fractional_scale_v1::preferred_scale` when the compositor supports
     /// it (covers 1.5/1.75 fractional), otherwise by `wl_output.scale`
@@ -181,6 +188,8 @@ impl Default for OverlayState {
             output: None,
             surface_w: 0,
             surface_h: 0,
+            mode_w: 0,
+            mode_h: 0,
             output_scale: 1.0,
             output_scale_int: 1,
             viewporter: None,
@@ -200,6 +209,25 @@ fn dbg(msg: &str) {
     if std::env::var_os("CUA_OVERLAY_DEBUG").is_some() {
         eprintln!("[cua-overlay-wl] {msg}");
     }
+}
+
+/// Resolve the logical surface-local size used for buffer sizing and the
+/// viewport destination.
+///
+/// Prefer a non-zero layer-surface Configure size. When the compositor sends
+/// Configure(0,0) for an anchor-all surface (`set_size(0,0)`), fall back to
+/// `wl_output::Mode` physical pixels divided by the effective output scale.
+fn logical_surface_size(state: &OverlayState) -> (u32, u32) {
+    if state.surface_w > 0 && state.surface_h > 0 {
+        return (state.surface_w, state.surface_h);
+    }
+    if state.mode_w == 0 || state.mode_h == 0 {
+        return (0, 0);
+    }
+    let scale = state.output_scale.max(1.0);
+    let lw = ((state.mode_w as f64) / scale).round().max(1.0) as u32;
+    let lh = ((state.mode_h as f64) / scale).round().max(1.0) as u32;
+    (lw, lh)
 }
 
 fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
@@ -276,10 +304,13 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
     }
 
     // Wait for the first configure event so we know the output dimensions
-    // before drawing.
+    // before drawing. Anchored full-screen surfaces often get Configure(0,0);
+    // in that case Mode physical dims are enough to proceed.
     for _ in 0..10 {
         queue.roundtrip(&mut state)?;
-        if state.configured && state.surface_w > 0 && state.surface_h > 0 {
+        let has_size = (state.surface_w > 0 && state.surface_h > 0)
+            || (state.mode_w > 0 && state.mode_h > 0);
+        if state.configured && has_size {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -288,9 +319,23 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
     if !state.configured {
         anyhow::bail!("layer surface never received configure event");
     }
+    let (lw, lh) = logical_surface_size(&state);
+    if lw == 0 || lh == 0 {
+        anyhow::bail!(
+            "layer surface configured but no usable size (configure={}/{} mode={}/{})",
+            state.surface_w,
+            state.surface_h,
+            state.mode_w,
+            state.mode_h
+        );
+    }
     dbg(&format!(
-        "configured: w={} h={}",
-        state.surface_w, state.surface_h
+        "configured: logical={lw}x{lh} surface={}/{} mode={}/{} scale={:.3}",
+        state.surface_w,
+        state.surface_h,
+        state.mode_w,
+        state.mode_h,
+        state.output_scale
     ));
 
     // Main loop. Tick the render core at ~60Hz so motion + spring physics
@@ -417,9 +462,12 @@ fn redraw(
     let Some(surface) = state.surface.as_ref() else {
         return Ok(());
     };
-    // Logical (surface-local) dimensions from the layer-surface configure.
-    let lw = state.surface_w.max(1);
-    let lh = state.surface_h.max(1);
+    // Logical surface-local size: Configure wins; Mode÷scale is the fallback
+    // for anchor-all surfaces that get Configure(0,0).
+    let (lw, lh) = logical_surface_size(state);
+    if lw == 0 || lh == 0 {
+        return Ok(());
+    }
     // Effective scale: fractional preferred_scale wins, else integer
     // wl_output.scale, else 1.0.
     let scale = state.output_scale.max(1.0);
@@ -638,14 +686,15 @@ impl Dispatch<WlOutput, ()> for OverlayState {
     ) {
         use wayland_client::protocol::wl_output;
         match event {
-            wl_output::Event::Mode { width: _, height: _, .. } => {
-                // Mode reports physical screen pixels, NOT the logical
-                // surface-local size. The layer-surface Configure event is
-                // the authoritative source for the logical size we use to
-                // size the buffer and set the viewport destination, so we
-                // intentionally ignore Mode here. (Previously Mode wrote to
-                // the same field as Configure, which clobbered logical dims
-                // with physical on runtime mode changes.)
+            wl_output::Event::Mode { width, height, .. } => {
+                // Physical screen pixels. Kept separate from surface_w/h so a
+                // later Mode event cannot overwrite a real logical Configure
+                // size. Used only when Configure leaves surface dims at 0.
+                if width > 0 && height > 0 {
+                    state.mode_w = width as u32;
+                    state.mode_h = height as u32;
+                    dbg(&format!("wl_output.mode = {width}x{height}"));
+                }
             }
             wl_output::Event::Scale { factor } => {
                 // Integer compositor scale (e.g. 2 on a retina panel). Used
