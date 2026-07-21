@@ -2467,8 +2467,18 @@ impl Tool for TypeTextTool {
             }
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        let browser_like = is_chromium_embedder(pid) || is_webkitgtk_embedder(pid);
+        // Chromium background refusal: on X11, synthetic keys to an unfocused
+        // renderer are dropped. On Wayland we can activate the target toplevel
+        // by pid (KWin scripting) then inject via libei — so do not refuse here
+        // when that path is available. Gmail/Electron demos use default
+        // background delivery; refusing made type_text unusable for #1 use case.
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
-            return refusal;
+            let wayland_can_activate =
+                crate::wayland::wayland_input_enabled() && pid != 0 && !crate::wayland::is_inject_mode();
+            if !(browser_like && wayland_can_activate) {
+                return refusal;
+            }
         }
 
         let px = args.get("x").and_then(|value| value.as_f64());
@@ -2484,15 +2494,11 @@ impl Tool for TypeTextTool {
 
         let text_len = text.chars().count();
 
-        // ── Focus-free AT-SPI EditableText (primary Wayland route) ──────────
-        // On Plasma/KWin, wtype's zwp_virtual_keyboard is unavailable and
-        // foreign-toplevel activate is not exposed, so the old path refused
-        // background typing and failed foreground activation. Native toolkits
-        // (Qt/GTK/KCalc, etc.) still accept EditableText.insertText without
-        // compositor focus — try that before any FocusedInputOnly refusal.
-        // Chromium/WebKit keep their key-event path (AT-SPI can echo without
-        // updating renderer state).
-        if !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid) && px.is_none() {
+        // ── Focus-free AT-SPI EditableText (native toolkits only) ───────────
+        // Qt/GTK/KDE accept EditableText.insertText without compositor focus.
+        // Never use this for Chromium/WebKit: insert can "succeed" without the
+        // renderer seeing a DOM input event (Gmail compose stays empty).
+        if !browser_like && px.is_none() {
             let text_ax = text.clone();
             let ax = tokio::task::spawn_blocking(move || {
                 if let Some(idx) = resolved_elem_idx {
@@ -2512,9 +2518,9 @@ impl Tool for TypeTextTool {
             }
         }
 
-        // No focus-free path left for this call shape — refuse background on
-        // plain Wayland (keys only reach the globally focused surface).
-        if resolved_elem_idx.is_none() && px.is_none() {
+        // No focus-free path left — refuse background on plain Wayland for
+        // non-browser apps. Browsers fall through to activate+libei below.
+        if !browser_like && resolved_elem_idx.is_none() && px.is_none() {
             if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
                 return refusal;
             }
@@ -2641,45 +2647,68 @@ impl Tool for TypeTextTool {
             }
         }
 
-        // AX addressing names one exact editable. Try this focus-free route
-        // before native Wayland keyboard injection, which can only target the
-        // compositor's globally focused surface.
+        // AX addressing names one exact editable. Native toolkits only —
+        // browsers must not use insertText (false success without DOM input).
         if let Some(idx) = resolved_elem_idx {
-            let text_at = text.clone();
-            let targeted = tokio::task::spawn_blocking(move || {
-                crate::atspi::type_into_editable_at(pid, idx, &text_at)
-            })
-            .await;
-            match targeted {
-                Ok(Ok(())) => {
-                    return type_text_ax_confirm_result(pid, text_len, "via targeted AT-SPI");
+            if !browser_like {
+                let text_at = text.clone();
+                let targeted = tokio::task::spawn_blocking(move || {
+                    crate::atspi::type_into_editable_at(pid, idx, &text_at)
+                })
+                .await;
+                match targeted {
+                    Ok(Ok(())) => {
+                        return type_text_ax_confirm_result(pid, text_len, "via targeted AT-SPI");
+                    }
+                    Ok(Err(_)) | Err(_)
+                        if !delivery.is_foreground() && crate::wayland::wayland_input_enabled() =>
+                    {
+                        return crate::input::delivery::background_unavailable_error(
+                            crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+                        );
+                    }
+                    _ => {}
                 }
-                Ok(Err(_)) | Err(_)
-                    if !delivery.is_foreground() && crate::wayland::wayland_input_enabled() =>
-                {
-                    return crate::input::delivery::background_unavailable_error(
-                        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-                    );
-                }
-                _ => {}
             }
         }
 
-        // Native Wayland: keys go to the *focused* surface (no pid/window
-        // targeting in the protocol). Type via the virtual-keyboard tool; pair
-        // with a prior `click`/`activate` to focus the intended window.
+        // Native Wayland: keys go to the *focused* surface. wtype is unavailable
+        // on KWin; `type_text` falls through to libei after activate.
+        //
+        // Browsers (Gmail, etc.): always activate the target toplevel by pid
+        // then inject keys — even when delivery_mode is the default background.
+        // Silent-drop risk only exists if we type without focusing the window;
+        // activate_window_for_input_target + KWin scripting closes that hole.
+        // Optional prior click (x,y) or GrabFocus(element_index) focuses the
+        // DOM field inside the page before keys land.
         if crate::wayland::wayland_input_enabled() {
-            if !delivery.is_foreground() {
+            let browser_keys = browser_like;
+            if !delivery.is_foreground() && !browser_keys {
                 return crate::input::delivery::background_unavailable_error(
                     crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
                 );
             }
+            if browser_keys {
+                if let Some(idx) = resolved_elem_idx {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::atspi::focus_element(pid, idx)
+                    })
+                    .await;
+                }
+            }
             let text_w = text.clone();
-            let result =
-                tokio::task::spawn_blocking(move || crate::wayland::type_text(xid, &text_w)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                // Explicit pid activation first (KWin); type_text also activates
+                // by window_id but that path may lack pid metadata on Wayland.
+                crate::wayland::activate_window_for_input_target(xid, Some(pid))?;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                crate::wayland::type_text(xid, &text_w)
+            })
+            .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
-                    "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
+                    "Typed {text_len} character(s) (via Wayland key events{}).",
+                    if browser_keys { ", browser activate+libei" } else { "" }
                 ))
                 .with_structured(type_text_structured(
                     "key_events",
