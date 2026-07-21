@@ -70,7 +70,10 @@ fn tx() -> Option<&'static Sender<WlOverlayCmd>> {
 /// MCP tool invocation; subsequent calls are no-ops.
 pub fn ensure_started() {
     TX.get_or_init(|| {
-        let (tx, rx) = bounded::<WlOverlayCmd>(64);
+        // Larger than the old 64: a burst of SetEnabled + MoveTo + ClickPulse
+        // across multi-cursor tools can fill a small queue, and try_send used
+        // to drop those silently — cursor never appears.
+        let (tx, rx) = bounded::<WlOverlayCmd>(256);
         thread::Builder::new()
             .name("cua-overlay-wl".into())
             .spawn(move || {
@@ -81,6 +84,23 @@ pub fn ensure_started() {
             .expect("spawn cua-overlay-wl thread");
         tx
     });
+}
+
+/// Enqueue a command for the owner thread. Prefer non-blocking try_send; if
+/// the channel is full, block briefly rather than drop — a dropped MoveTo /
+/// ClickPulse leaves the cursor invisible for the whole action.
+fn enqueue(tx: &Sender<WlOverlayCmd>, cmd: WlOverlayCmd) {
+    match tx.try_send(cmd) {
+        Ok(()) => {}
+        Err(crossbeam_channel::TrySendError::Full(cmd)) => {
+            if let Err(e) = tx.send_timeout(cmd, std::time::Duration::from_millis(100)) {
+                tracing::warn!("cua-overlay-wl command dropped (channel full/disconnected): {e}");
+            }
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            tracing::warn!("cua-overlay-wl command dropped: owner thread gone");
+        }
+    }
 }
 
 /// Translate a generic [`OverlayMsg`] (the cross-platform command shape)
@@ -99,16 +119,19 @@ pub fn forward(msg: &OverlayMsg) -> bool {
     match msg {
         OverlayMsg::Remove(k) => {
             let _ = k;
-            let _ = tx.try_send(WlOverlayCmd::Remove);
+            enqueue(tx, WlOverlayCmd::Remove);
             true
         }
         OverlayMsg::Cmd(kc) => {
             if matches!(&kc.cmd, OverlayCommand::ShowFocusRect(_)) {
                 return false;
             }
-            let _ = tx.try_send(WlOverlayCmd::Cmd {
-                cmd: kc.cmd.clone(),
-            });
+            enqueue(
+                tx,
+                WlOverlayCmd::Cmd {
+                    cmd: kc.cmd.clone(),
+                },
+            );
             true
         }
     }
@@ -421,20 +444,37 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
             // unbounded memfds open (EMFILE on the owner thread).
             const MAX_PENDING: usize = 3;
             while state.pending_buffers.len() >= MAX_PENDING {
-                queue.dispatch_pending(&mut state)?;
+                // Never let a dispatch error kill the owner thread — a dead
+                // overlay thread means no cursor for the rest of the process.
+                if let Err(e) = queue.dispatch_pending(&mut state) {
+                    tracing::warn!("cua-overlay-wl dispatch_pending: {e}");
+                    break;
+                }
                 if state.pending_buffers.len() >= MAX_PENDING {
                     std::thread::sleep(std::time::Duration::from_millis(1));
-                    queue.dispatch_pending(&mut state)?;
+                    if let Err(e) = queue.dispatch_pending(&mut state) {
+                        tracing::warn!("cua-overlay-wl dispatch_pending: {e}");
+                        break;
+                    }
                     if state.pending_buffers.len() >= MAX_PENDING {
                         break;
                     }
                 }
             }
-            if state.pending_buffers.len() < MAX_PENDING {
-                redraw(&mut state, &shm, &qh)?;
+            // Prefer to skip a frame when the compositor is still holding too
+            // many buffers, but never skip the frame that carries a new
+            // command — that is the one that makes the cursor appear.
+            if state.pending_buffers.len() < MAX_PENDING || had_cmd {
+                // redraw failures (shm OOM, etc.) must not exit the owner
+                // thread — log and keep serving later commands.
+                if let Err(e) = redraw(&mut state, &shm, &qh) {
+                    tracing::warn!("cua-overlay-wl redraw failed: {e}");
+                }
             }
         }
-        queue.dispatch_pending(&mut state)?;
+        if let Err(e) = queue.dispatch_pending(&mut state) {
+            tracing::warn!("cua-overlay-wl dispatch_pending: {e}");
+        }
 
         // Sleep for the remainder of the frame budget so the loop doesn't
         // spin. Channel-driven wakeups would be lower-latency, but layer

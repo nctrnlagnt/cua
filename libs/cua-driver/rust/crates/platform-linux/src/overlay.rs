@@ -194,6 +194,10 @@ pub fn is_enabled() -> bool {
 }
 
 pub fn is_enabled_for(key: &str) -> bool {
+    // cfg.enabled is the user/tool toggle (set_agent_cursor_enabled).
+    // core.visible is the same field SetEnabled writes, but also gets flipped
+    // by Remove on the Wayland path — prefer cfg.enabled so a transient hide
+    // cannot permanently suppress glides.
     RENDER
         .lock()
         .ok()
@@ -202,7 +206,7 @@ pub fn is_enabled_for(key: &str) -> bool {
                 m.cursors
                     .get(key)
                     .or_else(|| m.cursors.get("default"))
-                    .map(|rs| rs.core.visible)
+                    .map(|rs| rs.core.cfg.enabled && rs.core.visible)
             })
         })
         .unwrap_or(false)
@@ -241,31 +245,48 @@ pub fn current_motion_for(key: &str) -> cursor_overlay::MotionConfig {
 
 fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
     const SEED_OFFSET: f64 = 140.0;
-    let mut guard = RENDER.lock().unwrap();
-    let Some(map) = guard.as_mut() else {
-        return false;
+    let (sx, sy) = {
+        let mut guard = RENDER.lock().unwrap();
+        let Some(map) = guard.as_mut() else {
+            return false;
+        };
+        if map.ended.contains(key) {
+            return false;
+        }
+        let template = map.template.clone();
+        let k = key.clone();
+        let rs = map
+            .cursors
+            .entry(key.clone())
+            .or_insert_with(|| render_state_for_key(&template, &k));
+        if !(rs.core.cfg.enabled && rs.core.pos.0 < -50.0) {
+            return false;
+        }
+        let max_x = map.scr_w.max(2) as f64 - 2.0;
+        let max_y = map.scr_h.max(2) as f64 - 2.0;
+        let mut sx = (target_x - SEED_OFFSET).clamp(2.0, max_x);
+        let mut sy = (target_y - SEED_OFFSET).clamp(2.0, max_y);
+        if (sx - target_x).abs() < 8.0 && (sy - target_y).abs() < 8.0 {
+            sx = (target_x + SEED_OFFSET).clamp(2.0, max_x);
+            sy = (target_y + SEED_OFFSET).clamp(2.0, max_y);
+        }
+        rs.core.pos = (sx, sy);
+        (sx, sy)
     };
-    if map.ended.contains(key) {
-        return false;
+    // On layer-shell Wayland the paint core lives in the overlay owner thread,
+    // not in RENDER. SnapTo puts that core on-screen too; otherwise a dropped
+    // first MoveTo leaves the Wayland cursor at the off-screen sentinel forever.
+    #[cfg(target_os = "linux")]
+    if crate::wayland::is_wayland() && !crate::wayland::shell_helper::available() {
+        let _ = crate::wayland::overlay::forward(&OverlayMsg::Cmd(KeyedOverlayCommand {
+            key: key.clone(),
+            cmd: OverlayCommand::SnapTo {
+                x: sx,
+                y: sy,
+                heading_radians: Some(std::f64::consts::FRAC_PI_4),
+            },
+        }));
     }
-    let template = map.template.clone();
-    let k = key.clone();
-    let rs = map
-        .cursors
-        .entry(key.clone())
-        .or_insert_with(|| render_state_for_key(&template, &k));
-    if !(rs.core.cfg.enabled && rs.core.pos.0 < -50.0) {
-        return false;
-    }
-    let max_x = map.scr_w.max(2) as f64 - 2.0;
-    let max_y = map.scr_h.max(2) as f64 - 2.0;
-    let mut sx = (target_x - SEED_OFFSET).clamp(2.0, max_x);
-    let mut sy = (target_y - SEED_OFFSET).clamp(2.0, max_y);
-    if (sx - target_x).abs() < 8.0 && (sy - target_y).abs() < 8.0 {
-        sx = (target_x + SEED_OFFSET).clamp(2.0, max_x);
-        sy = (target_y + SEED_OFFSET).clamp(2.0, max_y);
-    }
-    rs.core.pos = (sx, sy);
     true
 }
 

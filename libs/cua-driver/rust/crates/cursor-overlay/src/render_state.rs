@@ -463,7 +463,14 @@ impl RenderStateCore {
                 true
             }
             OverlayCommand::SetEnabled(v) => {
+                self.cfg.enabled = v;
                 self.visible = v;
+                // Re-show after a hide: clear idle fade so the next paint is
+                // fully opaque instead of staying at idle_alpha≈0.
+                if v {
+                    self.idle_secs = 0.0;
+                    self.idle_alpha = 1.0;
+                }
                 true
             }
             OverlayCommand::SetMotion(m) => {
