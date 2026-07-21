@@ -1876,10 +1876,18 @@ fn window_to_screen_offset(pid: u32, xid: u64, title: Option<&str>) -> Option<(i
         // compositor exposes no geometry. Keep that observation as the final
         // fallback so stale default placement cannot override Sway IPC or a
         // shell helper's authoritative frame.
-        return prefer_authoritative_wayland_origin(
+        let result = prefer_authoritative_wayland_origin(
             authoritative,
             crate::wayland::observed_window_origin(pid),
         );
+        // KWin doesn't expose window geometry through foreign-toplevel or
+        // Sway IPC, so the sources above may all return None. Fall back to
+        // window_geometry, which itself tries kwin_script_geometry as a last
+        // resort — the only reliable source of window position on KDE Wayland.
+        let result = result.or_else(|| {
+            crate::wayland::window_geometry(xid).map(|(wx, wy, _, _)| (wx, wy))
+        });
+        return result;
     }
     // Resolve a usable window xid. `xid == 0` means "no hint" (get_element_bounds
     // has no window context); fall back to this pid's first window — the same

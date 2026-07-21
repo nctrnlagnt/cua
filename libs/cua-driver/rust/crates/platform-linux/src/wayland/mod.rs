@@ -1445,6 +1445,16 @@ pub fn window_geometry(window_id: u64) -> Option<(i32, i32, u32, u32)> {
         .iter()
         .find(|window| window.xid == window_id && window.width > 0 && window.height > 0)
     {
+        // KWin doesn't expose window geometry through foreign-toplevel or
+        // Sway IPC, so the compositor-reported origin is (0,0). Fall back to
+        // KWin's scripting DBus API for the authoritative frame geometry.
+        if window.x == 0 && window.y == 0 {
+            if let Some(pid) = window.pid {
+                if let Some(geo) = kwin_script_geometry(pid) {
+                    return Some(geo);
+                }
+            }
+        }
         return Some((window.x, window.y, window.width, window.height));
     }
     let identity = identity?;
@@ -1474,6 +1484,74 @@ pub fn window_geometry(window_id: u64) -> Option<(i32, i32, u32, u32)> {
         let window = app_matches[0];
         (window.x, window.y, window.width, window.height)
     })
+}
+
+/// Query KWin for a window's frame geometry by pid, using the KWin scripting
+/// DBus API. KWin's `workspace.windowList()` exposes authoritative
+/// `frameGeometry` (x, y, width, height) from the compositor — the one source
+/// that has real window positions on KDE Wayland. Foreign-toplevel and Sway
+/// IPC both report (0,0) on KWin, so this is the fallback of last resort.
+///
+/// Adds ~1s latency (DBus + journalctl round-trip); acceptable for a fallback
+/// that only runs on KWin when no other source provides geometry.
+fn kwin_script_geometry(pid: u32) -> Option<(i32, i32, u32, u32)> {
+    use std::io::Write;
+    let script = format!(
+        "var windows = workspace.windowList();\n\
+for (var i = 0; i < windows.length; i++) {{\n\
+    var w = windows[i];\n\
+    if (w.pid === {pid}) {{\n\
+        var geo = w.frameGeometry;\n\
+        print(\"CUA_KWIN_GEO\\t{pid}\\t\" + geo.x + \",\" + geo.y + \",\" + geo.width + \",\" + geo.height);\n\
+        break;\n\
+    }}\n\
+}}"
+    );
+
+    let script_path = format!("/tmp/cua-kwin-geo-{pid}.js");
+    let mut f = std::fs::File::create(&script_path).ok()?;
+    f.write_all(script.as_bytes()).ok()?;
+    drop(f);
+
+    let dbus_load = std::process::Command::new("dbus-send")
+        .args(["--session", "--print-reply", "--dest=org.kde.KWin",
+               "/Scripting", "org.kde.kwin.Scripting.loadScript",
+               &format!("string:{script_path}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status().ok()?;
+    if !dbus_load.success() { return None; }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let _ = std::process::Command::new("dbus-send")
+        .args(["--session", "--print-reply", "--dest=org.kde.KWin",
+               "/Scripting", "org.kde.kwin.Scripting.start"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let journal = std::process::Command::new("journalctl")
+        .args(["--user", "--since", "5 sec ago"])
+        .output().ok()?;
+    let stdout = String::from_utf8_lossy(&journal.stdout);
+    for line in stdout.lines() {
+        if line.contains("CUA_KWIN_GEO") && line.contains(&pid.to_string()) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for part in parts {
+                let nums: Vec<&str> = part.split(',').collect();
+                if nums.len() == 4 {
+                    let x = nums[0].parse::<f32>().ok()?;
+                    let y = nums[1].parse::<f32>().ok()?;
+                    let w = nums[2].parse::<f32>().ok()?;
+                    let h = nums[3].parse::<f32>().ok()?;
+                    if w > 0.0 && h > 0.0 {
+                        return Some((x as i32, y as i32, w as u32, h as u32));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Scroll after positioning the synthetic pointer over an output-relative
