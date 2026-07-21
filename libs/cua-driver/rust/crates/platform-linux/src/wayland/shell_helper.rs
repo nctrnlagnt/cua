@@ -31,7 +31,26 @@ const IFACE: &str = "org.cua.WinRects";
 
 pub fn available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| gdbus_call("GetRects", &[]).is_some())
+    *AVAILABLE.get_or_init(|| {
+        // WinRects is a GNOME Shell extension. On KWin/Plasma (and other
+        // non-GNOME sessions) the gdbus call always times out at 800ms —
+        // measured as ~750ms of dead time on every click before the KWin
+        // geometry path ran. Skip the probe entirely outside GNOME.
+        if !is_gnome_session() {
+            return false;
+        }
+        gdbus_call("GetRects", &[]).is_some()
+    })
+}
+
+/// True when the session looks like GNOME (where WinRects can be installed).
+fn is_gnome_session() -> bool {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if desktop.to_ascii_uppercase().split(':').any(|part| part == "GNOME") {
+        return true;
+    }
+    let session = std::env::var("DESKTOP_SESSION").unwrap_or_default();
+    session.to_ascii_lowercase().contains("gnome")
 }
 
 fn gdbus_call(method: &str, args: &[String]) -> Option<String> {
@@ -138,6 +157,11 @@ fn wait_timeout(mut child: std::process::Child, dur: Duration) -> Option<std::pr
 /// extents so accessibility frames line up with pixels. Older helpers omit the
 /// buffer fields and fall back to the frame origin.
 pub fn window_origin_for_pid(pid: u32) -> Option<(i32, i32)> {
+    // Skip the 800ms gdbus timeout on non-GNOME desktops (KWin/Plasma etc.)
+    // where the WinRects extension is not installed. `available()` caches.
+    if !available() {
+        return None;
+    }
     let raw = gdbus_call("GetRects", &[])?;
     // gdbus prints a GVariant tuple like `('[{"pid":..,"x":..}]',)`. Pull the
     // JSON array out robustly (first '[' .. last ']') rather than parsing the
@@ -172,6 +196,9 @@ pub fn window_origin_for_pid(pid: u32) -> Option<(i32, i32)> {
 /// shell already owns the authoritative stacking list, geometry, visibility,
 /// title, and PID, so use that metadata directly for `list_windows`.
 pub fn list_windows(filter_pid: Option<u32>) -> Option<Vec<WindowInfo>> {
+    if !available() {
+        return None;
+    }
     let raw = gdbus_call("GetRects", &[])?;
     parse_windows(&raw, filter_pid)
 }
@@ -183,6 +210,9 @@ pub fn list_windows(filter_pid: Option<u32>) -> Option<Vec<WindowInfo>> {
 /// returns true: portal input is focus-bound and otherwise targets whichever
 /// application the user happened to be using.
 pub fn activate_window(window_id: u64) -> bool {
+    if !available() {
+        return false;
+    }
     let Ok(window_id) = u32::try_from(window_id) else {
         return false;
     };

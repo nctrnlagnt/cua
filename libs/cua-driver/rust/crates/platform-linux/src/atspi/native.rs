@@ -267,11 +267,43 @@ async fn pid_of(
     dbus.get_connection_unix_process_id(bus).await.ok()
 }
 
+/// Cache of pid → application accessible object ref.
+///
+/// `app_for_pid` otherwise re-scans every registry child and issues
+/// `GetConnectionUnixProcessID` per app on every click. With ~20–30 desktop
+/// apps that alone is 1–2s (measured on Plasma: 24 apps, ~2s/click). The cache
+/// makes subsequent lookups a single AccessibleProxy build.
+fn app_ref_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u32, RawObjectRef>> {
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<u32, RawObjectRef>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Locate the application accessible whose backing process is `pid`.
 async fn app_for_pid<'a>(
     conn: &'a AccessibilityConnection,
     pid: u32,
 ) -> Result<Option<AccessibleProxy<'a>>> {
+    // Fast path: cached object ref from a prior successful lookup.
+    if let Ok(cache) = app_ref_cache().lock() {
+        if let Some(cached) = cache.get(&pid).cloned() {
+            drop(cache);
+            match call(accessible_for(conn, &cached)).await {
+                Some(Ok(acc)) => {
+                    dlog!("app_for_pid cache hit pid={pid}");
+                    return Ok(Some(acc));
+                }
+                _ => {
+                    // Stale (app restarted / bus name recycled) — drop and rescan.
+                    dlog!("app_for_pid cache stale pid={pid}; rescanning");
+                    if let Ok(mut cache) = app_ref_cache().lock() {
+                        cache.remove(&pid);
+                    }
+                }
+            }
+        }
+    }
+
     let zconn = conn.connection();
     // Every AT-SPI round-trip below can block on an app whose main loop isn't
     // servicing D-Bus — most commonly one holding a modal grab (an "Add/Edit/
@@ -279,7 +311,7 @@ async fn app_for_pid<'a>(
     // on the zbus default (~25s) per such app, which made get_window_state and
     // type_text hang on real apps (#1936). Bound each step with CALL_TIMEOUT and
     // skip/return instead of stalling — for type_text this returns fast so the
-    // tool falls back to XTEST, which still types into the focused dialog field.
+    // tool falls back to XTest, which still types into the focused dialog field.
     let root = match call(conn.root_accessible_on_registry()).await {
         Some(Ok(r)) => r,
         Some(Err(e)) => return Err(anyhow!("registry root unavailable: {e}")),
@@ -303,6 +335,9 @@ async fn app_for_pid<'a>(
         "registry root has {} application(s); seeking pid {pid}",
         apps.len()
     );
+    // While scanning, cache every resolved pid so the next click on any
+    // already-seen app is a cache hit (not just the target we sought).
+    let mut found: Option<RawObjectRef> = None;
     for child in apps {
         // A modal-grabbed app can't answer the pid query; skip it after
         // CALL_TIMEOUT rather than blocking the whole walk on it.
@@ -317,22 +352,33 @@ async fn app_for_pid<'a>(
             }
         };
         dlog!("  app bus={:?} pid={:?}", child.name_as_str(), cpid);
-        if cpid == Some(pid) {
-            let child = match RawObjectRef::from_atspi(&child) {
-                Some(child) => child,
-                None => continue,
-            };
-            return match call(accessible_for(conn, &child)).await {
-                Some(r) => r.map(Some),
-                None => {
-                    dlog!("  accessible_for timed out for pid {pid}");
-                    Ok(None)
-                }
-            };
+        let Some(cpid) = cpid else {
+            continue;
+        };
+        let Some(child_ref) = RawObjectRef::from_atspi(&child) else {
+            continue;
+        };
+        if let Ok(mut cache) = app_ref_cache().lock() {
+            cache.insert(cpid, child_ref.clone());
+        }
+        if cpid == pid {
+            found = Some(child_ref);
+            // Keep scanning briefly? No — we already have the match; remaining
+            // apps can be discovered on their first use. Exit early for latency.
+            break;
         }
     }
-    dlog!("no application accessible matched pid {pid}");
-    Ok(None)
+    let Some(child) = found else {
+        dlog!("no application accessible matched pid {pid}");
+        return Ok(None);
+    };
+    match call(accessible_for(conn, &child)).await {
+        Some(r) => r.map(Some),
+        None => {
+            dlog!("  accessible_for timed out for pid {pid}");
+            Ok(None)
+        }
+    }
 }
 
 /// Depth-first, pre-order walk of an application's windows. Mirrors the old
@@ -1432,6 +1478,11 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
     bounded(
         async {
             let conn = shared_connection().await?;
+            // Fast path: GetAccessibleAtPoint (same as screen-point clicks).
+            if let Some(action) = actuate_at_window_point(conn, pid, win_x, win_y).await? {
+                return Ok(Some(action));
+            }
+            // Fallback: full extents walk for toolkits without point query.
             let visited = match collect_visited(conn, pid).await? {
                 Some(v) => v,
                 None => return Ok(None),
@@ -1500,112 +1551,255 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
 }
 
 /// Vision/pixel click that actually lands — the Wayland answer (and a robust
-/// GTK4 path generally). Maps a *screen* pixel to the smallest `element_index`
-/// whose reconstructed screen frame covers it, then fires that element's
-/// primary action via [`perform_action`].
+/// GTK4 path generally).
 ///
-/// Why not [`perform_action_at_point`]: that one hit-tests raw
-/// `CoordType::Window` extents over an ad-hoc node set and `do_action`s the node
-/// it resolves directly. On GTK4 that can land on an inner, non-actuating node
-/// (a label inside the button) → a silent no-op that still returns `Some`
-/// ("false success"). And on native Wayland there is no virtual-pointer click to
-/// fall back to (Mutter drops synthetic pointer events). This routine instead
-/// uses the SAME screen-frame reconstruction that `get_window_state` exposes to
-/// the agent, via the GNOME Shell helper on Wayland and `_GTK_FRAME_EXTENTS` on
-/// X11, and actuates by `element_index`, the click path already verified
-/// working. So "click at pixel (x,y)" becomes "click the element the agent sees
-/// there", with no pointer injection and no reliance on `CoordType::Screen`
-/// (which GTK4 reports as (0,0)).
+/// Fast path: convert screen → window-local via compositor geometry, then
+/// `Component.GetAccessibleAtPoint` on each top-level frame and actuate (or
+/// climb to an actionable ancestor). Measured ~1ms on KCalc vs ~2s for the
+/// previous full-tree get_extents walk over 100+ nodes.
 ///
-/// `screen_x`/`screen_y` are full-display screen pixels (what the vision
-/// screenshot and `get_window_state` frames are in). Returns `Ok(Some(action))`
-/// on a hit, `Ok(None)` when no element covers the point so the caller can fall
-/// back to its native injection path.
+/// Slow path (fallback): reconstruct every indexable element's screen frame
+/// the same way `get_window_state` does, pick with [`select_click_target`], and
+/// `do_action` — used when GetAccessibleAtPoint is unavailable or returns
+/// nothing useful.
+///
+/// `screen_x`/`screen_y` are full-display screen pixels. Returns
+/// `Ok(Some(action))` on a hit, `Ok(None)` when no element covers the point.
 pub fn perform_action_at_screen_point(
     pid: u32,
     xid: u64,
     screen_x: i32,
     screen_y: i32,
 ) -> Result<Option<String>> {
-    bounded(
+    let t_enter = std::time::Instant::now();
+    let result = bounded(
         async {
+            let t0 = std::time::Instant::now();
             let conn = shared_connection().await?;
-            let visited = match collect_visited(conn, pid).await? {
-                Some(v) => v,
-                None => return Ok(None),
-            };
-            let web_document_origin = web_document_origin_for_visited(&visited, pid)
-                .await
-                .unwrap_or((0, 0));
-
-            // Reconstruct each indexable element's SCREEN frame the same way
-            // get_window_state does: WINDOW-relative extents (GTK4 reports these
-            // correctly; Screen is (0,0)) plus the window's screen origin (the
-            // GNOME Shell helper on Wayland, _GTK_FRAME_EXTENTS on X11). When no
-            // offset resolves, fall back to CoordType::Screen (correct on Qt/GTK3).
+            dlog!("screen_point: shared_connection {}ms", t0.elapsed().as_millis());
+            // Prefer window-local GetAccessibleAtPoint when we know the window
+            // origin (KWin/Sway/GTK extents). This is the usable-latency path.
+            let t1 = std::time::Instant::now();
             let offset = window_to_screen_offset(pid, xid, None);
-            let coord = if offset.is_some() {
-                CoordType::Window
-            } else {
-                CoordType::Screen
-            };
-            let (ox, oy) = offset.unwrap_or((0, 0));
-
-            // (element_index, x, y, w, h, is_passive_label) over the SAME indexable
-            // list `perform_action`/`get_window_state` use, so the chosen index
-            // maps straight back to a verified `element_index` actuation.
-            let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
-            let mut frames: Vec<(usize, i32, i32, u32, u32, bool)> = Vec::new();
-            for (idx, node) in action_nodes.iter().enumerate() {
-                if !node.has_component {
-                    continue;
+            dlog!(
+                "screen_point: window_to_screen_offset {}ms -> {offset:?}",
+                t1.elapsed().as_millis()
+            );
+            if let Some((ox, oy)) = offset {
+                let win_x = screen_x - ox;
+                let win_y = screen_y - oy;
+                dlog!(
+                    "screen_point fast path: screen=({screen_x},{screen_y}) \
+                     origin=({ox},{oy}) window=({win_x},{win_y})"
+                );
+                let t2 = std::time::Instant::now();
+                if let Some(action) =
+                    actuate_at_window_point(conn, pid, win_x, win_y).await?
+                {
+                    dlog!(
+                        "screen_point: actuate_at_window_point {}ms action={action:?}",
+                        t2.elapsed().as_millis()
+                    );
+                    return Ok(Some(action));
                 }
-                let Some(Ok(proxies)) = call(node.acc.proxies()).await else {
-                    continue;
-                };
-                let Some(Ok(comp)) = call(proxies.component()).await else {
-                    continue;
-                };
-                let Some(Ok((x, y, w, h))) = call(comp.get_extents(coord)).await else {
-                    continue;
-                };
-                if x == i32::MIN || y == i32::MIN || w <= 1 || h <= 1 {
-                    continue;
-                }
-                let (document_x, document_y) = if node.in_web_doc {
-                    web_document_origin
-                } else {
-                    (0, 0)
-                };
-                frames.push((
-                    idx,
-                    x + ox + document_x,
-                    y + oy + document_y,
-                    w as u32,
-                    h as u32,
-                    is_passive_role(&node.role),
-                ));
+                dlog!(
+                    "screen_point: actuate_at_window_point miss {}ms",
+                    t2.elapsed().as_millis()
+                );
             }
-
-            let Some(idx) = select_click_target(&frames, screen_x, screen_y) else {
-                return Ok(None);
-            };
-            let target = action_nodes[idx];
-            let ap = target
-                .acc
-                .proxies()
-                .await
-                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
-                .action()
-                .await
-                .map_err(|e| anyhow!("Action unavailable: {e}"))?;
-            ap.do_action(0)
-                .await
-                .map_err(|e| anyhow!("doAction failed: {e}"))?;
-            Ok(Some(target.actions.first().cloned().unwrap_or_default()))
+            // Fallback: full extents walk (toolkits without point query / offset).
+            let t3 = std::time::Instant::now();
+            let r =
+                perform_action_at_screen_point_extents(conn, pid, xid, screen_x, screen_y).await;
+            dlog!(
+                "screen_point: extents fallback {}ms",
+                t3.elapsed().as_millis()
+            );
+            r
         },
         || Ok(None),
-    )
+    );
+    dlog!(
+        "screen_point: total bounded {}ms",
+        t_enter.elapsed().as_millis()
+    );
+    result
+}
+
+/// Full-tree extents hit-test used when [`actuate_at_window_point`] cannot
+/// resolve the target. Expensive on large trees — keep as fallback only.
+async fn perform_action_at_screen_point_extents(
+    conn: &AccessibilityConnection,
+    pid: u32,
+    xid: u64,
+    screen_x: i32,
+    screen_y: i32,
+) -> Result<Option<String>> {
+    let visited = match collect_visited(conn, pid).await? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let web_document_origin = web_document_origin_for_visited(&visited, pid)
+        .await
+        .unwrap_or((0, 0));
+    let offset = window_to_screen_offset(pid, xid, None);
+    let coord = if offset.is_some() {
+        CoordType::Window
+    } else {
+        CoordType::Screen
+    };
+    let (ox, oy) = offset.unwrap_or((0, 0));
+    let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
+    let mut frames: Vec<(usize, i32, i32, u32, u32, bool)> = Vec::new();
+    for (idx, node) in action_nodes.iter().enumerate() {
+        if !node.has_component {
+            continue;
+        }
+        let Some(Ok(proxies)) = call(node.acc.proxies()).await else {
+            continue;
+        };
+        let Some(Ok(comp)) = call(proxies.component()).await else {
+            continue;
+        };
+        let Some(Ok((x, y, w, h))) = call(comp.get_extents(coord)).await else {
+            continue;
+        };
+        if x == i32::MIN || y == i32::MIN || w <= 1 || h <= 1 {
+            continue;
+        }
+        let (document_x, document_y) = if node.in_web_doc {
+            web_document_origin
+        } else {
+            (0, 0)
+        };
+        frames.push((
+            idx,
+            x + ox + document_x,
+            y + oy + document_y,
+            w as u32,
+            h as u32,
+            is_passive_role(&node.role),
+        ));
+    }
+    let Some(idx) = select_click_target(&frames, screen_x, screen_y) else {
+        return Ok(None);
+    };
+    let target = action_nodes[idx];
+    let ap = target
+        .acc
+        .proxies()
+        .await
+        .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?
+        .action()
+        .await
+        .map_err(|e| anyhow!("Action unavailable: {e}"))?;
+    ap.do_action(0)
+        .await
+        .map_err(|e| anyhow!("doAction failed: {e}"))?;
+    Ok(Some(target.actions.first().cloned().unwrap_or_default()))
+}
+
+/// Hit-test `(win_x, win_y)` in window coordinates via GetAccessibleAtPoint on
+/// each top-level frame of `pid`, then actuate the hit (or an actionable
+/// ancestor). Returns the action name on success.
+async fn actuate_at_window_point(
+    conn: &AccessibilityConnection,
+    pid: u32,
+    win_x: i32,
+    win_y: i32,
+) -> Result<Option<String>> {
+    let app = match app_for_pid(conn, pid).await? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let children = match call(app.get_children()).await {
+        Some(Ok(c)) => c,
+        _ => return Ok(None),
+    };
+    for child in children {
+        let Some(frame_ref) = RawObjectRef::from_atspi(&child) else {
+            continue;
+        };
+        let Some(Ok(frame)) = call(accessible_for(conn, &frame_ref)).await else {
+            continue;
+        };
+        let Some(Ok(proxies)) = call(frame.proxies()).await else {
+            continue;
+        };
+        let Some(Ok(comp)) = call(proxies.component()).await else {
+            continue;
+        };
+        let Some(Ok(hit_ref)) =
+            call(comp.get_accessible_at_point(win_x, win_y, CoordType::Window)).await
+        else {
+            continue;
+        };
+        if hit_ref.is_null() {
+            continue;
+        }
+        let Some(hit_raw) = RawObjectRef::from_atspi(&hit_ref) else {
+            continue;
+        };
+        if let Some(action) = actuate_accessible_or_ancestor(conn, &hit_raw).await {
+            return Ok(Some(action));
+        }
+    }
+    Ok(None)
+}
+
+/// `do_action(0)` on `start` if it has a real action; otherwise climb parents
+/// (GTK4 nests passive labels inside buttons). Stops after a few hops or at
+/// the root. Returns the action name that was fired.
+async fn actuate_accessible_or_ancestor(
+    conn: &AccessibilityConnection,
+    start: &RawObjectRef,
+) -> Option<String> {
+    let mut current = start.clone();
+    // Climb enough for label → button → panel nesting without walking the
+    // whole tree. Measured GTK4 depth under a calculator button is 1–2.
+    for _ in 0..8 {
+        let Some(Ok(acc)) = call(accessible_for(conn, &current)).await else {
+            return None;
+        };
+        let role = call(acc.get_role_name())
+            .await
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        let ifaces = call(acc.get_interfaces())
+            .await
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        if ifaces.contains(Interface::Action) && !is_passive_role(&role) {
+            if let Some(Ok(proxies)) = call(acc.proxies()).await {
+                if let Some(Ok(ap)) = call(proxies.action()).await {
+                    let n = call(ap.n_actions())
+                        .await
+                        .and_then(|r| r.ok())
+                        .unwrap_or(0);
+                    if n > 0 {
+                        let name = call(ap.get_name(0))
+                            .await
+                            .and_then(|r| r.ok())
+                            .unwrap_or_default();
+                        if call(ap.do_action(0)).await.and_then(|r| r.ok()).is_some() {
+                            dlog!(
+                                "actuate_accessible_or_ancestor: role={role:?} action={name:?}"
+                            );
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+        }
+        let Some(Ok(parent_ref)) = call(acc.parent()).await else {
+            return None;
+        };
+        if parent_ref.is_null() {
+            return None;
+        }
+        current = RawObjectRef::from_atspi(&parent_ref)?;
+    }
+    None
 }
 
 /// Roles that draw text/graphics but don't *do* anything when actuated. GTK4
@@ -1863,27 +2057,15 @@ fn parse_gtk_frame_extents(vals: &[u32]) -> Option<(i32, i32)> {
 /// query screen origins, by design) or when no X11 window resolves.
 fn window_to_screen_offset(pid: u32, xid: u64, title: Option<&str>) -> Option<(i32, i32)> {
     if crate::wayland::is_wayland() {
-        // Native Wayland: clients can't query a window's screen origin, and
-        // AT-SPI CoordType::Screen collapses to (0,0) on Mutter. The bundled
-        // `org.cua.WinRects` GNOME Shell extension supplies the window's screen
-        // origin (`meta_window.get_frame_rect()`); combined with the per-widget
-        // CoordType::Window coords (which GTK4 reports correctly on Wayland too)
-        // this reconstructs real screen coords — the GNOME analogue of the X11
-        // `_GTK_FRAME_EXTENTS` path below. `None` (no extension) keeps the
-        // legacy Screen path (still (0,0), but no worse than before).
+        // KWin first: busctl getWindowInfo by cached uuid — no foreign-toplevel
+        // walk and no GNOME shell helper. A click asks for this origin twice;
+        // kwin_window_geometry memoizes for 1s so the second call is free.
+        if let Some(origin) = crate::wayland::kwin_window_origin(pid) {
+            return Some(origin);
+        }
         let authoritative = authoritative_wayland_origin(pid, xid, title);
-        // AT-SPI discovery can only guess a native Wayland origin when the
-        // compositor exposes no geometry. Keep that observation as the final
-        // fallback so stale default placement cannot override Sway IPC or a
-        // shell helper's authoritative frame.
-        let result = prefer_authoritative_wayland_origin(
-            authoritative,
-            crate::wayland::observed_window_origin(pid),
-        );
-        // KWin doesn't expose window geometry through foreign-toplevel or
-        // Sway IPC, so the sources above may all return None. Fall back to
-        // window_geometry, which itself tries kwin_script_geometry as a last
-        // resort — the only reliable source of window position on KDE Wayland.
+        let observed = crate::wayland::observed_window_origin(pid);
+        let result = prefer_authoritative_wayland_origin(authoritative, observed);
         let result = result.or_else(|| {
             crate::wayland::window_geometry(xid).map(|(wx, wy, _, _)| (wx, wy))
         });
@@ -1912,8 +2094,16 @@ fn authoritative_wayland_origin(pid: u32, xid: u64, title: Option<&str>) -> Opti
     if !crate::wayland::is_wayland() {
         return None;
     }
+    // Prefer compositor geometry (Sway IPC / KWin getWindowInfo) before the
+    // GNOME-only shell helper — on KWin the helper is absent and must not be
+    // probed first (or at all; see shell_helper::available).
     crate::wayland::inject_accessibility_offset(pid)
         .or_else(|| crate::wayland::sway_ipc::window_origin_for_pid(pid))
+        .or_else(|| {
+            (xid != 0)
+                .then(|| crate::wayland::window_geometry(xid).map(|(x, y, _, _)| (x, y)))
+                .flatten()
+        })
         .or_else(|| {
             (xid != 0)
                 .then(|| crate::wayland::sway_ipc::window_for_id(xid))

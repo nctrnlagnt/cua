@@ -1410,6 +1410,17 @@ pub fn window_local_to_output(window_id: u64, x: i32, y: i32) -> (i32, i32) {
         .unwrap_or((x, y))
 }
 
+/// Like [`window_local_to_output`], but uses `pid` for the KWin geometry path
+/// so we never run `list_windows_dispatch` (which enriches with a full AT-SPI
+/// registry walk — ~500ms on a busy Plasma desktop). Prefer this whenever the
+/// caller already knows the target pid (click/type/scroll tools always do).
+pub fn window_local_to_output_for_pid(pid: u32, window_id: u64, x: i32, y: i32) -> (i32, i32) {
+    if let Some((ox, oy)) = kwin_window_origin(pid) {
+        return (ox.saturating_add(x), oy.saturating_add(y));
+    }
+    window_local_to_output(window_id, x, y)
+}
+
 /// Resolve geometry through stable title/app identity when a foreign-toplevel
 /// object ID came from an earlier Wayland connection. Protocol object IDs are
 /// connection-local, so direct equality is only a fast path.
@@ -1445,12 +1456,14 @@ pub fn window_geometry(window_id: u64) -> Option<(i32, i32, u32, u32)> {
         .iter()
         .find(|window| window.xid == window_id && window.width > 0 && window.height > 0)
     {
-        // KWin doesn't expose window geometry through foreign-toplevel or
-        // Sway IPC, so the compositor-reported origin is (0,0). Fall back to
-        // KWin's scripting DBus API for the authoritative frame geometry.
+        // On KWin, foreign-toplevel exposes pid/title/app_id but NOT window
+        // geometry (x/y are always 0). Fall back to KWin's DBus geometry
+        // path (uuid map + getWindowInfo) which has authoritative frame
+        // geometry from the compositor — without journalctl or fixed sleeps.
         if window.x == 0 && window.y == 0 {
             if let Some(pid) = window.pid {
-                if let Some(geo) = kwin_script_geometry(pid) {
+                let title = (!window.title.is_empty()).then_some(window.title.as_str());
+                if let Some(geo) = kwin_window_geometry(pid, title) {
                     return Some(geo);
                 }
             }
@@ -1486,72 +1499,379 @@ pub fn window_geometry(window_id: u64) -> Option<(i32, i32, u32, u32)> {
     })
 }
 
-/// Query KWin for a window's frame geometry by pid, using the KWin scripting
-/// DBus API. KWin's `workspace.windowList()` exposes authoritative
-/// `frameGeometry` (x, y, width, height) from the compositor — the one source
-/// that has real window positions on KDE Wayland. Foreign-toplevel and Sway
-/// IPC both report (0,0) on KWin, so this is the fallback of last resort.
+/// One KWin-managed toplevel, identified by KWin's internal window uuid.
 ///
-/// Adds ~1s latency (DBus + journalctl round-trip); acceptable for a fallback
-/// that only runs on KWin when no other source provides geometry.
-fn kwin_script_geometry(pid: u32) -> Option<(i32, i32, u32, u32)> {
-    use std::io::Write;
-    let script = format!(
-        "var windows = workspace.windowList();\n\
-for (var i = 0; i < windows.length; i++) {{\n\
-    var w = windows[i];\n\
-    if (w.pid === {pid}) {{\n\
-        var geo = w.frameGeometry;\n\
-        print(\"CUA_KWIN_GEO\\t{pid}\\t\" + geo.x + \",\" + geo.y + \",\" + geo.width + \",\" + geo.height);\n\
-        break;\n\
-    }}\n\
-}}"
-    );
+/// Foreign-toplevel / AT-SPI give us pid + title but not screen position on
+/// KDE Wayland. KWin's `getWindowInfo(uuid)` DBus method returns live
+/// geometry in ~4ms once we know the uuid; the uuid map is filled by a
+/// one-shot KWin script (journal marker, tight poll — no fixed sleeps).
+#[derive(Clone, Debug)]
+struct KwinWindowEntry {
+    pid: u32,
+    uuid: String,
+}
 
-    let script_path = format!("/tmp/cua-kwin-geo-{pid}.js");
-    let mut f = std::fs::File::create(&script_path).ok()?;
-    f.write_all(script.as_bytes()).ok()?;
-    drop(f);
+struct KwinUuidCache {
+    entries: Vec<KwinWindowEntry>,
+}
 
-    let dbus_load = std::process::Command::new("dbus-send")
-        .args(["--session", "--print-reply", "--dest=org.kde.KWin",
-               "/Scripting", "org.kde.kwin.Scripting.loadScript",
-               &format!("string:{script_path}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status().ok()?;
-    if !dbus_load.success() { return None; }
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let _ = std::process::Command::new("dbus-send")
-        .args(["--session", "--print-reply", "--dest=org.kde.KWin",
-               "/Scripting", "org.kde.kwin.Scripting.start"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    std::thread::sleep(std::time::Duration::from_millis(500));
+fn kwin_uuid_cache() -> &'static Mutex<KwinUuidCache> {
+    static CACHE: OnceLock<Mutex<KwinUuidCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(KwinUuidCache { entries: Vec::new() }))
+}
 
-    let journal = std::process::Command::new("journalctl")
-        .args(["--user", "--since", "5 sec ago"])
-        .output().ok()?;
-    let stdout = String::from_utf8_lossy(&journal.stdout);
-    for line in stdout.lines() {
-        if line.contains("CUA_KWIN_GEO") && line.contains(&pid.to_string()) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            for part in parts {
-                let nums: Vec<&str> = part.split(',').collect();
-                if nums.len() == 4 {
-                    let x = nums[0].parse::<f32>().ok()?;
-                    let y = nums[1].parse::<f32>().ok()?;
-                    let w = nums[2].parse::<f32>().ok()?;
-                    let h = nums[3].parse::<f32>().ok()?;
-                    if w > 0.0 && h > 0.0 {
-                        return Some((x as i32, y as i32, w as u32, h as u32));
-                    }
-                }
+/// Short-lived geometry cache (pid → frame). A single click asks for the
+/// same origin twice (overlay glide + AT-SPI offset); without this each call
+/// re-runs `list_windows_dispatch` + busctl (~70–80ms × 2).
+struct KwinGeoMemo {
+    pid: u32,
+    geo: (i32, i32, u32, u32),
+    at: std::time::Instant,
+}
+
+fn kwin_geo_memo() -> &'static Mutex<Option<KwinGeoMemo>> {
+    static MEMO: OnceLock<Mutex<Option<KwinGeoMemo>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(None))
+}
+
+/// Resolve screen geometry for a window on KWin/Plasma Wayland.
+///
+/// Fast path: memoized result (same pid within 1s) or cached uuid →
+/// `busctl getWindowInfo` (~4ms).
+/// Slow path (cache miss): one KWin script dumps pid/uuid via `print`, then
+/// we poll journalctl for the marker (tight loop, no fixed 700ms sleep).
+///
+/// Uses `busctl` subprocesses rather than zbus so this sync path never nests
+/// a Tokio runtime inside the CUA driver's executor.
+fn kwin_window_geometry(pid: u32, title: Option<&str>) -> Option<(i32, i32, u32, u32)> {
+    if let Ok(memo) = kwin_geo_memo().lock() {
+        if let Some(m) = memo.as_ref() {
+            if m.pid == pid && m.at.elapsed() < std::time::Duration::from_secs(1) {
+                return Some(m.geo);
             }
         }
     }
+    let geo = kwin_window_geometry_uncached(pid, title)?;
+    if let Ok(mut memo) = kwin_geo_memo().lock() {
+        *memo = Some(KwinGeoMemo {
+            pid,
+            geo,
+            at: std::time::Instant::now(),
+        });
+    }
+    Some(geo)
+}
+
+fn kwin_window_geometry_uncached(pid: u32, title: Option<&str>) -> Option<(i32, i32, u32, u32)> {
+    if let Some(uuid) = kwin_cached_uuid(pid, title) {
+        if let Some(geo) = kwin_get_window_info_geometry(&uuid) {
+            return Some(geo);
+        }
+        // Window may have closed; drop stale uuid and refresh.
+        kwin_invalidate_uuid(&uuid);
+    }
+    kwin_refresh_uuid_cache()?;
+    let uuid = kwin_cached_uuid(pid, title)?;
+    kwin_get_window_info_geometry(&uuid)
+}
+
+/// Screen origin for `pid` via KWin (no foreign-toplevel walk). Used by
+/// `window_to_screen_offset` so AT-SPI clicks skip `list_windows_dispatch`.
+pub fn kwin_window_origin(pid: u32) -> Option<(i32, i32)> {
+    kwin_window_geometry(pid, None).map(|(x, y, _, _)| (x, y))
+}
+
+fn kwin_cached_uuid(pid: u32, title: Option<&str>) -> Option<String> {
+    // Collect candidate uuids under the lock, then drop it before any
+    // busctl call (getWindowInfo caption lookup must not hold the mutex).
+    let candidate_uuids: Vec<String> = {
+        let cache = kwin_uuid_cache().lock().ok()?;
+        cache
+            .entries
+            .iter()
+            .filter(|e| e.pid == pid)
+            .map(|e| e.uuid.clone())
+            .collect()
+    };
+    if candidate_uuids.is_empty() {
+        return None;
+    }
+    if candidate_uuids.len() == 1 {
+        return Some(candidate_uuids[0].clone());
+    }
+    // Multiple top-levels share this pid (common for browsers / Electron).
+    // Disambiguate with title when provided via live getWindowInfo captions.
+    if let Some(title) = title {
+        let mut titled = Vec::new();
+        for uuid in &candidate_uuids {
+            if kwin_get_window_info_caption(uuid).as_deref() == Some(title) {
+                titled.push(uuid.clone());
+            }
+        }
+        if titled.len() == 1 {
+            return Some(titled[0].clone());
+        }
+    }
     None
+}
+
+fn kwin_invalidate_uuid(uuid: &str) {
+    if let Ok(mut cache) = kwin_uuid_cache().lock() {
+        cache.entries.retain(|e| e.uuid != uuid);
+    }
+}
+
+/// Live geometry from KWin's `getWindowInfo` via busctl — no scripting.
+///
+/// Measured ~4ms per call on Plasma 6.7. Output shape (verified on sandbox):
+/// `a{sv} N "x" d 211.486 "y" d 249.339 "width" d 640 "height" d 508 ...`
+fn kwin_get_window_info_geometry(uuid: &str) -> Option<(i32, i32, u32, u32)> {
+    let output = std::process::Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.kde.KWin",
+            "/KWin",
+            "org.kde.KWin",
+            "getWindowInfo",
+            "s",
+            uuid,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    kwin_parse_get_window_info(&stdout)
+}
+
+/// Parse busctl `a{sv}` text for x/y/width/height doubles.
+fn kwin_parse_get_window_info(stdout: &str) -> Option<(i32, i32, u32, u32)> {
+    // Empty map: `a{sv} 0`
+    if stdout.contains("a{sv} 0") && !stdout.contains("\"x\"") {
+        return None;
+    }
+    let x = kwin_busctl_dict_f64(stdout, "x")?;
+    let y = kwin_busctl_dict_f64(stdout, "y")?;
+    let w = kwin_busctl_dict_f64(stdout, "width")?;
+    let h = kwin_busctl_dict_f64(stdout, "height")?;
+    if w > 0.0 && h > 0.0 {
+        Some((x as i32, y as i32, w as u32, h as u32))
+    } else {
+        None
+    }
+}
+
+/// Extract a double value for `key` from busctl dict text: `"key" d 123.4`.
+fn kwin_busctl_dict_f64(stdout: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{key}\" d ");
+    let rest = stdout.split(&needle).nth(1)?;
+    let token = rest.split_whitespace().next()?;
+    token.parse::<f64>().ok()
+}
+
+/// Extract a string value for `key` from busctl dict text: `"key" s "value"`.
+fn kwin_busctl_dict_str(stdout: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\" s ");
+    let rest = stdout.split(&needle).nth(1)?;
+    let rest = rest.trim_start();
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        return Some(stripped[..end].to_string());
+    }
+    // Unquoted single-token fallback.
+    rest.split_whitespace().next().map(|s| s.to_string())
+}
+
+fn kwin_get_window_info_caption(uuid: &str) -> Option<String> {
+    let output = std::process::Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.kde.KWin",
+            "/KWin",
+            "org.kde.KWin",
+            "getWindowInfo",
+            "s",
+            uuid,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    kwin_busctl_dict_str(&stdout, "caption")
+}
+
+/// One-shot KWin script dump of pid/uuid into the uuid cache.
+///
+/// Uses `Script.run` (not `Scripting.start`) and polls journalctl for the
+/// `CUA_KWIN_MAP` marker with a tight loop — no fixed multi-hundred-ms sleeps.
+/// Cache hits then use getWindowInfo only.
+fn kwin_refresh_uuid_cache() -> Option<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let script_name = format!("cua-kwin-geo-{token}");
+    let marker = format!("CUA_KWIN_MAP_{token}");
+    let script_path = format!("/tmp/{script_name}.js");
+    kwin_write_map_script(&script_path, &marker)?;
+    let script_id = kwin_load_script(&script_path, &script_name);
+    if script_id.is_none() {
+        let _ = std::fs::remove_file(&script_path);
+        return None;
+    }
+    let script_id = script_id?;
+    kwin_run_script(script_id);
+    let entries = kwin_poll_map_journal(&marker);
+    kwin_unload_script(&script_name);
+    let _ = std::fs::remove_file(&script_path);
+    if entries.is_empty() {
+        return None;
+    }
+    if let Ok(mut cache) = kwin_uuid_cache().lock() {
+        cache.entries = entries;
+    }
+    Some(())
+}
+
+/// Write the pid/uuid dump script. Caption is not included — multi-window
+/// pids are disambiguated later via getWindowInfo.
+fn kwin_write_map_script(script_path: &str, marker: &str) -> Option<()> {
+    use std::io::Write;
+    let script = format!(
+        r#"var windows = workspace.windowList();
+for (var i = 0; i < windows.length; i++) {{
+    var w = windows[i];
+    if (w.pid > 0) {{
+        print("{marker}\t" + w.pid + "\t" + w.internalId);
+    }}
+}}
+print("{marker}\tDONE");
+"#
+    );
+    let mut f = std::fs::File::create(script_path).ok()?;
+    f.write_all(script.as_bytes()).ok()?;
+    Some(())
+}
+
+/// `loadScript` via busctl; returns KWin script id or None.
+fn kwin_load_script(script_path: &str, script_name: &str) -> Option<i32> {
+    let load = std::process::Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.kde.KWin",
+            "/Scripting",
+            "org.kde.kwin.Scripting",
+            "loadScript",
+            "ss",
+            script_path,
+            script_name,
+        ])
+        .output()
+        .ok()?;
+    if !load.status.success() {
+        return None;
+    }
+    // busctl: `i 17`
+    let script_id = String::from_utf8_lossy(&load.stdout)
+        .split_whitespace()
+        .nth(1)?
+        .parse::<i32>()
+        .ok()?;
+    (script_id >= 0).then_some(script_id)
+}
+
+/// Run a previously loaded KWin script. Stdio is discarded so busctl replies
+/// never leak onto the computer-use protocol stdout.
+fn kwin_run_script(script_id: i32) {
+    let _ = std::process::Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.kde.KWin",
+            &format!("/Scripting/Script{script_id}"),
+            "org.kde.kwin.Script",
+            "run",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn kwin_unload_script(script_name: &str) {
+    let _ = std::process::Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.kde.KWin",
+            "/Scripting",
+            "org.kde.kwin.Scripting",
+            "unloadScript",
+            "s",
+            script_name,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Poll journalctl until the DONE marker appears or 400ms elapses.
+fn kwin_poll_map_journal(marker: &str) -> Vec<KwinWindowEntry> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        if let Some(parsed) = kwin_read_map_from_journal(marker) {
+            return parsed;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Vec::new()
+}
+
+/// Collect `CUA_KWIN_MAP_*` lines from the last few seconds of the user journal.
+fn kwin_read_map_from_journal(marker: &str) -> Option<Vec<KwinWindowEntry>> {
+    let journal = std::process::Command::new("journalctl")
+        .args(["--user", "--since", "3 sec ago", "--no-pager"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&journal.stdout);
+    // journalctl may collapse tabs to spaces; accept either form of DONE.
+    if !stdout.lines().any(|l| l.contains(marker) && l.contains("DONE")) {
+        return None;
+    }
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        if !line.contains(marker) || line.contains("DONE") {
+            continue;
+        }
+        // After journal whitespace normalisation: MARKER pid uuid
+        if let Some(rest) = line.split(marker).nth(1) {
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            if fields.len() < 2 {
+                continue;
+            }
+            let Ok(pid) = fields[0].parse::<u32>() else {
+                continue;
+            };
+            let uuid = fields[1].to_string();
+            if uuid.is_empty() {
+                continue;
+            }
+            entries.push(KwinWindowEntry { pid, uuid });
+        }
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
 }
 
 /// Scroll after positioning the synthetic pointer over an output-relative

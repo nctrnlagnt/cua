@@ -321,6 +321,13 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
     let skip_x11_arrival = false;
 
     if skip_x11_arrival {
+        // Cosmetic only: AT-SPI / inject clicks do not depend on the overlay
+        // cursor arriving first. On KWin/Mutter without the X11 arrival
+        // oneshot we used to sleep a fixed 350ms per move — that alone made
+        // every click feel laggy (~500ms wall). Fire MoveTo and return; the
+        // overlay thread still animates for the user without blocking tools.
+        // Explicit glide_duration_ms > 0 still waits so scripted demos can
+        // sync to a fixed flight time.
         let wait_ms = {
             let guard = RENDER.lock().unwrap();
             guard
@@ -331,10 +338,10 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
                     if d > 0.0 {
                         d as u64
                     } else {
-                        350
+                        0
                     }
                 })
-                .unwrap_or(350)
+                .unwrap_or(0)
         };
         send_command_for(
             key,
@@ -344,7 +351,9 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
                 end_heading_radians: std::f64::consts::FRAC_PI_4,
             },
         );
-        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
         return;
     }
 

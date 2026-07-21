@@ -2120,8 +2120,12 @@ impl Tool for ClickTool {
         // Resolve the screen point the cursor glides to. Tool coordinates are
         // always window-local screenshot pixels; native Wayland translates
         // through compositor/AT-SPI geometry while X11 uses XTranslateCoordinates.
+        // Prefer the pid-aware path: on KWin it uses getWindowInfo (~4ms) and
+        // skips list_windows_dispatch's AT-SPI enrichment (~500ms).
+        let t_click = std::time::Instant::now();
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
+            Some(crate::wayland::window_local_to_output_for_pid(
+                pid,
                 xid,
                 x.round() as i32,
                 y.round() as i32,
@@ -2129,6 +2133,12 @@ impl Tool for ClickTool {
         } else {
             None
         };
+        if std::env::var_os("CUA_ATSPI_DEBUG").is_some() {
+            eprintln!(
+                "[cua-click] geometry {}ms -> {wayland_output_point:?}",
+                t_click.elapsed().as_millis()
+            );
+        }
         let glide_target = if let Some((sx, sy)) = wayland_output_point {
             Some((sx as f64, sy as f64))
         } else {
@@ -2137,11 +2147,18 @@ impl Tool for ClickTool {
                 .ok()
                 .and_then(|r| r.ok())
         };
+        let t_glide = std::time::Instant::now();
         if let Some((sx, sy)) = glide_target {
             overlay_glide_to_for(&cursor_id, sx, sy).await;
             crate::overlay::send_command_for(
                 cursor_id.clone(),
                 cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
+            );
+        }
+        if std::env::var_os("CUA_ATSPI_DEBUG").is_some() {
+            eprintln!(
+                "[cua-click] glide+pulse {}ms",
+                t_glide.elapsed().as_millis()
             );
         }
 
@@ -2151,6 +2168,7 @@ impl Tool for ClickTool {
         // delivery_mode: background (default) = no-focus-steal injection;
         // foreground = activate the target window (EWMH) first, then inject,
         // then restore prior active. Mirrors macOS/Windows.
+        let t_act = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<&'static str> {
             if crate::wayland::wayland_input_enabled() {
                 // Vision/pixel click on native Wayland. Mutter drops synthetic
@@ -2221,6 +2239,14 @@ impl Tool for ClickTool {
             }
         })
         .await;
+        if std::env::var_os("CUA_ATSPI_DEBUG").is_some() {
+            eprintln!(
+                "[cua-click] actuate {}ms total {}ms result={:?}",
+                t_act.elapsed().as_millis(),
+                t_click.elapsed().as_millis(),
+                result.as_ref().map(|r| r.as_ref().unwrap_or(&"err"))
+            );
+        }
         let mode_label = if delivery.is_foreground() {
             "foreground"
         } else {
