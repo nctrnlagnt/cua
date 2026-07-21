@@ -38,6 +38,13 @@ use wayland_client::{
     },
     Connection, Dispatch, Proxy, QueueHandle,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
@@ -122,8 +129,26 @@ struct OverlayState {
     shm: Option<WlShm>,
     layer_shell: Option<ZwlrLayerShellV1>,
     output: Option<WlOutput>,
-    output_w: u32,
-    output_h: u32,
+    /// Logical (surface-local) dimensions from the layer-surface `configure`
+    /// event. The wl_shm buffer is allocated at `surface_w × scale` physical
+    /// pixels (see `output_scale`); a `wp_viewport` maps that buffer back to
+    /// this logical size so the compositor places it correctly on a HiDPI
+    /// output. Populated ONLY by `ZwlrLayerSurfaceV1::Configure` — never by
+    /// `wl_output::Mode`, which reports physical screen pixels.
+    surface_w: u32,
+    surface_h: u32,
+    /// Effective output scale (logical→physical). Driven by
+    /// `wp_fractional_scale_v1::preferred_scale` when the compositor supports
+    /// it (covers 1.5/1.75 fractional), otherwise by `wl_output.scale`
+    /// (integer only). Stays `1.0` on unscaled outputs.
+    output_scale: f64,
+    /// Integer `wl_output.scale`, kept separately as a fallback for the
+    /// `set_buffer_scale` path on compositors without `wp_viewporter`.
+    output_scale_int: i32,
+    viewporter: Option<WpViewporter>,
+    fractional_mgr: Option<WpFractionalScaleManagerV1>,
+    viewport: Option<WpViewport>,
+    fractional: Option<WpFractionalScaleV1>,
     surface: Option<WlSurface>,
     layer_surface: Option<ZwlrLayerSurfaceV1>,
     configured: bool,
@@ -154,8 +179,14 @@ impl Default for OverlayState {
             shm: None,
             layer_shell: None,
             output: None,
-            output_w: 0,
-            output_h: 0,
+            surface_w: 0,
+            surface_h: 0,
+            output_scale: 1.0,
+            output_scale_int: 1,
+            viewporter: None,
+            fractional_mgr: None,
+            viewport: None,
+            fractional: None,
             surface: None,
             layer_surface: None,
             configured: false,
@@ -202,6 +233,19 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
 
     // Build the layer surface: fullscreen, overlay layer, click-through.
     let surface = compositor.create_surface(&qh, ());
+
+    // Wire up HiDPI scaling for the surface. `wp_viewporter` lets us map a
+    // physical-pixel buffer back onto the logical surface-local rectangle
+    // (required for fractional scales); `wp_fractional_scale_v1` tells us the
+    // compositor's preferred fractional scale via `preferred_scale` events.
+    // Both are optional — compositors without them fall back to integer
+    // `wl_output.scale` + `set_buffer_scale`.
+    let viewport = state.viewporter.as_ref().map(|vp| vp.get_viewport(&surface, &qh, ()));
+    let fractional = state
+        .fractional_mgr
+        .as_ref()
+        .map(|fm| fm.get_fractional_scale(&surface, &qh, ()));
+
     let layer_surface = layer_shell.get_layer_surface(
         &surface,
         Some(&output),
@@ -223,6 +267,8 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
 
     state.surface = Some(surface);
     state.layer_surface = Some(layer_surface);
+    state.viewport = viewport;
+    state.fractional = fractional;
 
     // First commit kicks off the configure handshake.
     if let Some(s) = state.surface.as_ref() {
@@ -233,7 +279,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
     // before drawing.
     for _ in 0..10 {
         queue.roundtrip(&mut state)?;
-        if state.configured && state.output_w > 0 && state.output_h > 0 {
+        if state.configured && state.surface_w > 0 && state.surface_h > 0 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -244,7 +290,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
     }
     dbg(&format!(
         "configured: w={} h={}",
-        state.output_w, state.output_h
+        state.surface_w, state.surface_h
     ));
 
     // Main loop. Tick the render core at ~60Hz so motion + spring physics
@@ -342,14 +388,23 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
 /// it to the layer surface.
 ///
 /// Pipeline:
-/// 1. Allocate a memfd-backed wl_shm pool sized at output_w × output_h.
+/// 1. Allocate a memfd-backed wl_shm pool sized at the output's *physical*
+///    pixel dimensions (`logical × output_scale`).
 /// 2. Paint the cross-platform cursor (bloom + click pulse + gradient
-///    arrow) into a `tiny_skia::Pixmap` via `cursor_overlay::paint_cursor`
-///    — same call the X11 path uses.
+///    arrow) into a `tiny_skia::Pixmap` at that physical resolution,
+///    passing `output_scale` as `backing_scale` so `core.pos` (logical) is
+///    mapped to the correct physical pixel — this is the crux of the HiDPI
+///    fix: previously the buffer was logical-sized with `backing_scale=1.0`,
+///    so a cursor at logical `(x,y)` landed at half the screen on a 2× output.
 /// 3. Channel-swap RGBA → BGRA into the wl_shm buffer (wl_shm Argb8888
 ///    is little-endian BGRA in memory). This is the inverse of the swap
 ///    in `ext_screencopy::encode_buffer_to_png`.
-/// 4. Attach + damage + commit on the layer surface.
+/// 4. If `output_scale != 1.0`, use `wp_viewport` to map the physical
+///    buffer onto the logical surface-local rectangle (destination =
+///    `surface_w × surface_h`), as required by `wp-fractional-scale-v1` and
+///    correct for any scale. Without a viewport, fall back to integer
+///    `set_buffer_scale`.
+/// 5. Attach + damage + commit on the layer surface.
 ///
 /// When the cursor is hidden (`core.visible == false`, idle-faded, or
 /// off-screen sentinel) the pixmap is all zeros — the surface remains
@@ -362,8 +417,16 @@ fn redraw(
     let Some(surface) = state.surface.as_ref() else {
         return Ok(());
     };
-    let w = state.output_w.max(1);
-    let h = state.output_h.max(1);
+    // Logical (surface-local) dimensions from the layer-surface configure.
+    let lw = state.surface_w.max(1);
+    let lh = state.surface_h.max(1);
+    // Effective scale: fractional preferred_scale wins, else integer
+    // wl_output.scale, else 1.0.
+    let scale = state.output_scale.max(1.0);
+    // Physical buffer dimensions. paint_cursor expects a backing_scale-sized
+    // pixmap so the logical cursor position maps to the right physical pixel.
+    let w = (lw as f64 * scale).round().max(1.0) as u32;
+    let h = (lh as f64 * scale).round().max(1.0) as u32;
     let stride = w as i32 * 4;
     let size = (stride as usize) * (h as usize);
 
@@ -391,20 +454,18 @@ fn redraw(
             "tiny_skia::Pixmap::new({w}, {h}) failed — out of memory for the overlay buffer"
         ),
     };
-    // backing_scale=1.0 matches the X11 path; per-output Wayland scale is
-    // a follow-up (would consume `wl_output.scale` and `preferred_buffer
-    // _scale` from wl_surface v6).
-    cursor_overlay::paint_cursor(&mut pm, &state.core, 0.0, 0.0, None, 1.0);
+    // `core.pos` is in logical screen points; `paint_cursor` multiplies it
+    // by `backing_scale` to land at the right physical pixel in the pixmap.
+    cursor_overlay::paint_cursor(&mut pm, &state.core, 0.0, 0.0, None, scale as f32);
 
     // CUA_OVERLAY_DEBUG=1 paints a 60x60 magenta square at the cursor's
     // current pos on top of the gradient arrow. Useful when validating
     // layer-shell visibility on a new compositor — the gradient arrow is
     // small at native scale and easy to miss in a screenshot, while the
-    // magenta block is impossible to miss.
+    // magenta block is impossible to miss. Position is logical→physical.
     if std::env::var_os("CUA_OVERLAY_DEBUG").is_some() {
-        let (cx, cy) = state.core.pos;
-        let cx = cx as i32;
-        let cy = cy as i32;
+        let cx = (state.core.pos.0 * scale) as i32;
+        let cy = (state.core.pos.1 * scale) as i32;
         let half = 30i32;
         for dy in -half..half {
             for dx in -half..half {
@@ -454,9 +515,27 @@ fn redraw(
     state.pending_buffers.insert(buffer_id, (ptr, size, fd));
 
     dbg(&format!(
-        "redraw w={w} h={h} stride={stride} buf_id={buffer_id} pos=({:.1},{:.1}) visible={}",
+        "redraw logical={lw}x{lh} scale={scale:.3} phys={w}x{h} stride={stride} buf_id={buffer_id} pos=({:.1},{:.1}) visible={}",
         state.core.pos.0, state.core.pos.1, state.core.visible
     ));
+
+    // Map the physical buffer onto the logical surface-local rectangle. The
+    // viewport destination is in surface-local (logical) coords; the source
+    // covers the full physical buffer. This is the only correct way to
+    // submit a fractional-scaled buffer (`wp-fractional-scale-v1` requires
+    // `wp_viewporter`), and it works for integer scales too. Without a
+    // viewport, fall back to integer `set_buffer_scale`.
+    if scale != 1.0 {
+        if let Some(vp) = state.viewport.as_ref() {
+            vp.set_source(0.0, 0.0, w as f64, h as f64);
+            vp.set_destination(lw as i32, lh as i32);
+        } else {
+            surface.set_buffer_scale(state.output_scale_int.max(1));
+        }
+    } else {
+        surface.set_buffer_scale(1);
+    }
+
     surface.attach(Some(&buffer), 0, 0);
     surface.damage_buffer(0, 0, w as i32, h as i32);
     surface.commit();
@@ -493,6 +572,25 @@ impl Dispatch<wl_registry::WlRegistry, ()> for OverlayState {
                     if state.output.is_none() {
                         state.output =
                             Some(registry.bind::<WlOutput, _, _>(name, version.min(4), qh, ()));
+                    }
+                }
+                "wp_viewporter" => {
+                    if state.viewporter.is_none() {
+                        state.viewporter = Some(
+                            registry.bind::<WpViewporter, _, _>(name, version.min(1), qh, ()),
+                        );
+                    }
+                }
+                "wp_fractional_scale_manager_v1" => {
+                    if state.fractional_mgr.is_none() {
+                        state.fractional_mgr = Some(
+                            registry.bind::<WpFractionalScaleManagerV1, _, _>(
+                                name,
+                                version.min(1),
+                                qh,
+                                (),
+                            ),
+                        );
                     }
                 }
                 "zwlr_layer_shell_v1" => {
@@ -539,11 +637,30 @@ impl Dispatch<WlOutput, ()> for OverlayState {
         _: &QueueHandle<Self>,
     ) {
         use wayland_client::protocol::wl_output;
-        if let wl_output::Event::Mode { width, height, .. } = event {
-            if width > 0 && height > 0 {
-                state.output_w = width as u32;
-                state.output_h = height as u32;
+        match event {
+            wl_output::Event::Mode { width: _, height: _, .. } => {
+                // Mode reports physical screen pixels, NOT the logical
+                // surface-local size. The layer-surface Configure event is
+                // the authoritative source for the logical size we use to
+                // size the buffer and set the viewport destination, so we
+                // intentionally ignore Mode here. (Previously Mode wrote to
+                // the same field as Configure, which clobbered logical dims
+                // with physical on runtime mode changes.)
             }
+            wl_output::Event::Scale { factor } => {
+                // Integer compositor scale (e.g. 2 on a retina panel). Used
+                // directly when no fractional-scale object exists, and as the
+                // `set_buffer_scale` fallback for compositors without
+                // `wp_viewporter`.
+                if factor > 0 {
+                    state.output_scale_int = factor;
+                    if state.fractional.is_none() {
+                        state.output_scale = factor as f64;
+                    }
+                    dbg(&format!("wl_output.scale = {factor}"));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -577,10 +694,10 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for OverlayState {
         {
             layer.ack_configure(serial);
             if width > 0 {
-                state.output_w = width;
+                state.surface_w = width;
             }
             if height > 0 {
-                state.output_h = height;
+                state.surface_h = height;
             }
             state.configured = true;
         }
@@ -629,6 +746,68 @@ impl Dispatch<WlBuffer, ()> for OverlayState {
                 super::cleanup_mmap(ptr, size, fd);
             }
             buffer.destroy();
+        }
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for OverlayState {
+    fn event(
+        _: &mut Self,
+        _: &WpViewporter,
+        _: <WpViewporter as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpViewport, ()> for OverlayState {
+    fn event(
+        _: &mut Self,
+        _: &WpViewport,
+        _: <WpViewport as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpFractionalScaleManagerV1, ()> for OverlayState {
+    fn event(
+        _: &mut Self,
+        _: &WpFractionalScaleManagerV1,
+        _: <WpFractionalScaleManagerV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpFractionalScaleV1, ()> for OverlayState {
+    fn event(
+        state: &mut Self,
+        _: &WpFractionalScaleV1,
+        event: <WpFractionalScaleV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            // `scale` is in 1/120 of a unit (120 == 1.0, 180 == 1.5, 210 ==
+            // 1.75). This is the authoritative fractional scale for the
+            // surface and overrides the integer `wl_output.scale`.
+            if scale > 0 {
+                let factor = scale as f64 / 120.0;
+                if factor > 0.0 {
+                    state.output_scale = factor;
+                    dbg(&format!(
+                        "wp_fractional_scale.preferred_scale = {scale} ({factor:.3})"
+                    ));
+                }
+            }
         }
     }
 }

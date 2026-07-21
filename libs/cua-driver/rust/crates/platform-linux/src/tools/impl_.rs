@@ -1058,7 +1058,25 @@ fn resolve_element_local_coords(
 
 fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
     let (bx, by, bw, bh) = crate::atspi::get_element_bounds(pid, idx)?;
-    let scale = desktop_scale_factor();
+    // Two rendering strategies, two scale owners — never both:
+    //
+    // - X11 overlay: paints into a physical-pixel pixmap at backing_scale=1.0,
+    //   so AT-SPI logical bounds must be pre-multiplied here by the desktop
+    //   scale (Qt/GDK/kdeglobals env detection) to land at the right physical
+    //   pixel.
+    // - Wayland overlay: paints into a physical-pixel pixmap but passes the
+    //   real `output_scale` as `backing_scale` to `paint_cursor`, which does
+    //   the logical→physical multiply itself. Pre-multiplying here too would
+    //   double-scale the glow (env_scale × output_scale).
+    //
+    // On Wayland, AT-SPI bounds are already logical (the click path confirms
+    // this), so return them as-is and let the overlay's `backing_scale`
+    // handle the conversion.
+    let scale = if crate::wayland::wayland_input_enabled() {
+        1.0
+    } else {
+        desktop_scale_factor()
+    };
     Ok((
         (bx as f64 + bw as f64 / 2.0) * scale,
         (by as f64 + bh as f64 / 2.0) * scale,

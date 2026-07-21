@@ -134,8 +134,27 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
         key: key.clone(),
         cmd: cmd.clone(),
     });
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(msg.clone());
+    // On Wayland sessions that use the native layer-shell overlay (KDE,
+    // wlroots compositors — anything with zwlr_layer_shell_v1 and no
+    // shell_helper), suppress the X11 overlay broadcast entirely. Both
+    // overlays would receive the same coordinates, but they have
+    // incompatible scale expectations: the X11 overlay paints at
+    // backing_scale=1.0 in a physical pixmap (expects pre-multiplied
+    // coords), while the layer-shell overlay passes the real output
+    // scale as backing_scale (expects logical coords). Broadcasting to
+    // both produces a wrong invisible cursor under the correct visible
+    // one. GNOME (shell_helper) still gets both — its X11 overlay is
+    // inert under mutter and shell_helper handles the visible cursor.
+    #[cfg(target_os = "linux")]
+    let skip_x11 = crate::wayland::is_wayland()
+        && !crate::wayland::shell_helper::available();
+    #[cfg(not(target_os = "linux"))]
+    let skip_x11 = false;
+
+    if !skip_x11 {
+        if let Some(tx) = CMD_TX.get() {
+            let _ = tx.try_send(msg.clone());
+        }
     }
     // Also forward to the native-Wayland layer-shell overlay when Wayland
     // is opted in. The wayland overlay's `forward` is a no-op when its
