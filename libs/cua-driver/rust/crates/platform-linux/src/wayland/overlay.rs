@@ -192,6 +192,13 @@ struct OverlayState {
     /// Replaces the per-redraw `mem::forget` leak: the previous frame's
     /// memory is reclaimed as soon as the compositor releases it.
     pending_buffers: HashMap<u32, (*mut libc::c_void, usize, i32)>,
+    /// Object id of the buffer most recently attached+committed. On
+    /// `wl_buffer.release` of this id we must re-attach (dirty-only redraw
+    /// would otherwise leave the surface with no buffer → blank cursor).
+    current_buffer_id: Option<u32>,
+    /// Set when the compositor released `current_buffer_id` and we have not
+    /// yet committed a replacement. Forces a redraw on the next loop tick.
+    needs_reattach: bool,
 }
 
 // SAFETY: the raw pointers in pending_buffers point at mmap regions owned
@@ -224,6 +231,8 @@ impl Default for OverlayState {
             configured: false,
             core: RenderStateCore::new(CursorConfig::default()),
             pending_buffers: HashMap::new(),
+            current_buffer_id: None,
+            needs_reattach: false,
         }
     }
 }
@@ -433,12 +442,16 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
         let dt = now.duration_since(last_tick).as_secs_f64().min(0.05);
         last_tick = now;
         let arrived = state.core.tick_motion(dt);
+        // needs_reattach: compositor released the buffer we last committed
+        // while we were idle (dirty-only). Without a forced redraw the
+        // surface has no buffer and the cursor vanishes.
         let needs_frame = arrived
             || state.core.path.is_some()
             || state.core.spring.is_some()
             || state.core.click_t.is_some()
             || state.core.idle_alpha < 0.999
-            || had_cmd;
+            || had_cmd
+            || state.needs_reattach;
         if state.configured && needs_frame {
             // Cap in-flight shm buffers so a slow compositor cannot pin
             // unbounded memfds open (EMFILE on the owner thread).
@@ -627,6 +640,11 @@ fn redraw(
     // done with the underlying memory — no leak, no use-after-free.
     let buffer_id = buffer.id().protocol_id();
     state.pending_buffers.insert(buffer_id, (ptr, size, fd));
+    // Remember which buffer is currently on the surface so a later
+    // wl_buffer.release of it can force a reattach (dirty-only redraw
+    // would otherwise leave the surface buffer-less → blank cursor).
+    state.current_buffer_id = Some(buffer_id);
+    state.needs_reattach = false;
 
     dbg(&format!(
         "redraw logical={lw}x{lh} scale={scale:.3} phys={w}x{h} stride={stride} buf_id={buffer_id} pos=({:.1},{:.1}) visible={}",
@@ -859,6 +877,13 @@ impl Dispatch<WlBuffer, ()> for OverlayState {
             let id = buffer.id().protocol_id();
             if let Some((ptr, size, fd)) = state.pending_buffers.remove(&id) {
                 super::cleanup_mmap(ptr, size, fd);
+            }
+            // If this was the buffer currently on the surface, the surface
+            // is now buffer-less until the next commit. Force a redraw so
+            // dirty-only idle does not leave a blank cursor.
+            if state.current_buffer_id == Some(id) {
+                state.current_buffer_id = None;
+                state.needs_reattach = true;
             }
             buffer.destroy();
         }
