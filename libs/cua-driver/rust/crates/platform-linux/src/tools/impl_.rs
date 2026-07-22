@@ -52,8 +52,16 @@ pub fn load_driver_config() -> DriverConfig {
     cfg
 }
 
+/// Key for per-window screenshot scale / zoom state.
+///
+/// Must include `window_id`: multiple top-level windows often share one pid
+/// (Firefox, Chromium). A pid-only map overwrote ratios across windows and
+/// made pixel clicks land tens to hundreds of pixels off (2026-07-21 X11
+/// desktop companion session).
+type WindowKey = (u32, u64);
+
 pub struct ResizeRegistry {
-    ratios: std::sync::Mutex<std::collections::HashMap<u32, f64>>,
+    ratios: std::sync::Mutex<std::collections::HashMap<WindowKey, f64>>,
 }
 
 impl ResizeRegistry {
@@ -62,18 +70,21 @@ impl ResizeRegistry {
             ratios: std::sync::Mutex::new(Default::default()),
         }
     }
-    pub fn set_ratio(&self, pid: u32, ratio: f64) {
-        self.ratios.lock().unwrap().insert(pid, ratio);
+    pub fn set_ratio(&self, pid: u32, window_id: u64, ratio: f64) {
+        self.ratios
+            .lock()
+            .unwrap()
+            .insert((pid, window_id), ratio);
     }
-    pub fn clear_ratio(&self, pid: u32) {
-        self.ratios.lock().unwrap().remove(&pid);
+    pub fn clear_ratio(&self, pid: u32, window_id: u64) {
+        self.ratios.lock().unwrap().remove(&(pid, window_id));
     }
-    pub fn ratio(&self, pid: u32) -> Option<f64> {
-        self.ratios.lock().unwrap().get(&pid).copied()
+    pub fn ratio(&self, pid: u32, window_id: u64) -> Option<f64> {
+        self.ratios.lock().unwrap().get(&(pid, window_id)).copied()
     }
 }
 
-/// Per-process zoom context — stores padded crop origin and resize scale from
+/// Per-window zoom context — stores padded crop origin and resize scale from
 /// the most recent `zoom` call so `click(from_zoom=true)` can translate
 /// zoom-image pixel coordinates back to full-window coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -94,7 +105,7 @@ impl ZoomContext {
 }
 
 pub struct ZoomRegistry {
-    inner: std::sync::Mutex<std::collections::HashMap<u32, ZoomContext>>,
+    inner: std::sync::Mutex<std::collections::HashMap<WindowKey, ZoomContext>>,
 }
 
 impl ZoomRegistry {
@@ -103,11 +114,11 @@ impl ZoomRegistry {
             inner: std::sync::Mutex::new(Default::default()),
         }
     }
-    pub fn set(&self, pid: u32, ctx: ZoomContext) {
-        self.inner.lock().unwrap().insert(pid, ctx);
+    pub fn set(&self, pid: u32, window_id: u64, ctx: ZoomContext) {
+        self.inner.lock().unwrap().insert((pid, window_id), ctx);
     }
-    pub fn get(&self, pid: u32) -> Option<ZoomContext> {
-        self.inner.lock().unwrap().get(&pid).copied()
+    pub fn get(&self, pid: u32, window_id: u64) -> Option<ZoomContext> {
+        self.inner.lock().unwrap().get(&(pid, window_id)).copied()
     }
 }
 
@@ -780,10 +791,10 @@ impl Tool for GetWindowStateTool {
                 if let Some((b64_opt, file_path, w, h, orig_w)) = shot_opt {
                     if let Some(ow) = orig_w {
                         if w > 0 {
-                            state.resize_registry.set_ratio(pid, ow as f64 / w as f64);
+                            state.resize_registry.set_ratio(pid, xid, ow as f64 / w as f64);
                         }
                     } else {
-                        state.resize_registry.clear_ratio(pid);
+                        state.resize_registry.clear_ratio(pid, xid);
                     }
                     // ax mode + screenshot_out_file writes the PNG to disk and
                     // returns b64=None — never embed the image bytes in that case.
@@ -1158,14 +1169,14 @@ fn type_text_structured(path: &str, characters: usize, verified: bool) -> Value 
     s
 }
 
-/// Structured payload for the Electron/Chromium AX-echo case: the AT-SPI
-/// `insertText` rung returned success on a Chromium embedder, but on those
-/// surfaces the a11y bridge can accept and echo the write while the renderer
+/// Structured payload for the browser AX-echo case: the AT-SPI
+/// `insertText` rung returned success on a browser embedder, but on those
+/// surfaces the a11y bridge can accept and echo the write while the UI
 /// never observes it — so a path=="ax" "confirm" is a shim echo, not ground
 /// truth. Mirrors the macOS `type_text` `ax_echo_surface` branch: report
 /// effect:"unverifiable" + escalation:{recommended:"px"} (a renderer-focus
 /// problem — pixel-focus the field, not foreground-activate it).
-fn type_text_structured_electron(text_len: usize) -> Value {
+fn type_text_structured_browser_unverified(text_len: usize) -> Value {
     json!({
         "path": "ax",
         "characters": text_len,
@@ -1173,33 +1184,37 @@ fn type_text_structured_electron(text_len: usize) -> Value {
         "effect": "unverifiable",
         "escalation": {
             "recommended": "px",
-            "reason": "Electron/web surface — the AX write was echoed but the \
-                       renderer may not have observed it. Confirm via the screenshot; \
-                       if it didn't land, re-type with the element px action (pass x,y \
+            "reason": "Browser/web surface — the AX write was echoed but the \
+                       UI may not have observed it. Confirm via the screenshot; \
+                       if it didn't land, re-type with foreground delivery (real key events) or the element px action (pass x,y \
                        to pixel-focus the field, then type)."
         }
     })
 }
 
 /// Build the success `ToolResult` for an AT-SPI insert that the driver would
-/// otherwise mark `verified:true` (path=="ax"). Applies the Electron/Chromium
-/// AX-echo suppression: when `pid` is a Chromium embedder, the a11y layer can
-/// echo the `insertText` write back while the renderer ignores it, so we refuse
+/// otherwise mark `verified:true` (path=="ax"). Applies the browser
+/// AX-echo suppression: when `pid` is a browser embedder, the a11y layer can
+/// echo the `insertText` write back while the UI ignores it, so we refuse
 /// to claim a confirmed insert — downgrade to effect:"unverifiable" +
 /// escalation:{recommended:"px"} and tell the agent to confirm via screenshot.
 /// Probe ONLY here, on the rung that would otherwise confirm, so native AT-SPI
 /// types pay nothing. `route` is the human route phrase, e.g. "via AT-SPI".
 /// Mirrors macOS `type_text`'s `ax_echo_surface` gate.
 fn type_text_ax_confirm_result(pid: u32, text_len: usize, route: &str) -> ToolResult {
-    if is_chromium_embedder(pid) {
+    // Chromium, WebKitGTK, and Gecko (Firefox) can all acknowledge AT-SPI
+    // EditableText writes without the real page/chrome field updating.
+    // Measured on X11 Firefox URL bar: insertText returned success while
+    // the address bar stayed empty ("New Tab").
+    if is_browser_embedder(pid) {
         return ToolResult::text(format!(
-            "📨 Sent (unverified) {text_len} character(s) ({route}). — Electron/web \
-             surface: the AX layer accepts and echoes the write but the renderer may \
+            "📨 Sent (unverified) {text_len} character(s) ({route}). — Browser/web \
+             surface: the AX layer accepts and echoes the write but the UI may \
              not have observed it, so the driver cannot confirm via AX. Verify via the \
-             screenshot; if it didn't land, re-type with the px form (pass x,y to \
-             pixel-focus the field)."
+             screenshot; if it didn't land, re-type with foreground delivery \
+             (real key events) or the px form (pass x,y to pixel-focus the field)."
         ))
-        .with_structured(type_text_structured_electron(text_len));
+        .with_structured(type_text_structured_browser_unverified(text_len));
     }
     ToolResult::text(format!("Typed {text_len} character(s) ({route})."))
         .with_structured(type_text_structured("ax", text_len, true))
@@ -1273,6 +1288,33 @@ fn is_chromium_embedder(pid: u32) -> bool {
         }
     }
     false
+}
+
+/// True when `pid` is Firefox / Gecko (or a common fork). Same AT-SPI
+/// false-success problem as Chromium for chrome UI fields (URL bar) and
+/// many page inputs: insertText can succeed without the field changing.
+fn is_gecko_embedder(pid: u32) -> bool {
+    if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+        let c = comm.trim();
+        if c == "firefox" || c.starts_with("firefox") || c == "librewolf" || c == "waterfox" {
+            return true;
+        }
+    }
+    match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) => {
+            let s = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+            s.contains("firefox")
+                || s.contains("librewolf")
+                || s.contains("waterfox")
+                || s.contains("gecko")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Surfaces where AT-SPI text insert must not be treated as ground truth.
+fn is_browser_embedder(pid: u32) -> bool {
+    is_chromium_embedder(pid) || is_webkitgtk_embedder(pid) || is_gecko_embedder(pid)
 }
 
 fn is_webkitgtk_embedder(pid: u32) -> bool {
@@ -2093,10 +2135,16 @@ impl Tool for ClickTool {
             None => return ToolResult::error("Provide either element_index or window_id + x/y."),
         };
         let from_zoom = args.bool_or("from_zoom", false);
-        let mut x = args.f64_or("x", 0.0);
-        let mut y = args.f64_or("y", 0.0);
+        // Keep the agent-supplied image/zoom pixels for the result text.
+        // After zoom/resize rewrite, (x,y) are window-local capture pixels
+        // (same grid as the unscaled screenshot / X11 client).
+        let image_x = args.f64_or("x", 0.0);
+        let image_y = args.f64_or("y", 0.0);
+        let mut x = image_x;
+        let mut y = image_y;
+        let mut resize_ratio = 1.0_f64;
         if from_zoom {
-            match self.state.zoom_registry.get(pid) {
+            match self.state.zoom_registry.get(pid, xid) {
                 Some(ctx) => {
                     let (wx, wy) = ctx.zoom_to_window(x, y);
                     x = wx;
@@ -2108,7 +2156,10 @@ impl Tool for ClickTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
+            // ratio = original_capture_w / screenshot_w (e.g. 2458/1568).
+            // Multiply image pixels up to window-local capture pixels.
+            resize_ratio = ratio;
             x *= ratio;
             y *= ratio;
         }
@@ -2260,11 +2311,42 @@ impl Tool for ClickTool {
             }
             // A pixel/coordinate click is never driver-verifiable (no read-back) —
             // verified:false, effect:"unverifiable"; the caller confirms via
-            // screenshot. path reports the rung taken.
-            Ok(Ok(path)) => ToolResult::text(format!(
-                "✅ Clicked at ({x:.1}, {y:.1}) × {count} (delivery_mode={mode_label})."
-            ))
-            .with_structured(json!({ "path": path, "verified": false, "effect": "unverifiable" })),
+            // screenshot. path reports the rung taken. Do not claim "Clicked"
+            // as if the target reacted — desktop companion false-success loops
+            // (2026-07-21) came from that wording.
+            //
+            // Result text must not present post-ratio window-local coords as if
+            // they were the agent's image aim or desktop inject point. Gmail QA
+            // (2026-07-21): "Sent click at (1802, 658)" after a 1.57× resize
+            // made the agent treat image y=420 as already-mapped desktop space
+            // and invent a Y-bias story. Report image → window-local → screen.
+            Ok(Ok(path)) => {
+                let screen = glide_target
+                    .map(|(sx, sy)| format!(" screen=({sx:.1},{sy:.1})"))
+                    .unwrap_or_default();
+                let ratio_note = if (resize_ratio - 1.0).abs() > 1e-6 {
+                    format!(" resize_ratio={resize_ratio:.4}")
+                } else {
+                    String::new()
+                };
+                ToolResult::text(format!(
+                    "Sent click input × {count} (delivery_mode={mode_label}, path={path}). \
+                     image=({image_x:.1},{image_y:.1}) → window_local=({x:.1},{y:.1}){screen}{ratio_note}. \
+                     Effect unverified — confirm via the post-action screenshot before the next mutation."
+                ))
+                .with_structured(json!({
+                    "path": path,
+                    "verified": false,
+                    "effect": "unverifiable",
+                    "image_x": image_x,
+                    "image_y": image_y,
+                    "window_local_x": x,
+                    "window_local_y": y,
+                    "resize_ratio": resize_ratio,
+                    "screen_x": glide_target.map(|(sx, _)| sx),
+                    "screen_y": glide_target.map(|(_, sy)| sy),
+                }))
+            }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -2467,7 +2549,9 @@ impl Tool for TypeTextTool {
             }
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
-        let browser_like = is_chromium_embedder(pid) || is_webkitgtk_embedder(pid);
+        // Include Gecko (Firefox): same false AT-SPI insert success as Chromium
+        // on the URL bar and many page fields (X11 Firefox demo, 2026-07-21).
+        let browser_like = is_browser_embedder(pid);
         // Chromium background refusal: on X11, synthetic keys to an unfocused
         // renderer are dropped. On Wayland we can activate the target toplevel
         // by pid (KWin scripting) then inject via libei — so do not refuse here
@@ -2529,8 +2613,7 @@ impl Tool for TypeTextTool {
         // Nested cua-compositor: focus-free inject after optional AT-SPI miss.
         if crate::wayland::is_inject_mode()
             && resolved_elem_idx.is_some()
-            && !is_chromium_embedder(pid)
-            && !is_webkitgtk_embedder(pid)
+            && !is_browser_embedder(pid)
         {
             let idx = resolved_elem_idx.expect("checked above");
             let text_at = text.clone();
@@ -2611,7 +2694,7 @@ impl Tool for TypeTextTool {
         // Chromium/WebKit observe the same event sequence as a user.
         if delivery.is_foreground()
             && crate::wayland::wayland_input_enabled()
-            && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid))
+            && is_browser_embedder(pid)
         {
             if let Some(idx) = resolved_elem_idx {
                 let focused =
@@ -2783,11 +2866,11 @@ impl Tool for TypeTextTool {
                 });
             }
         }
-        // Foreground means the caller explicitly permits activation. Chromium
-        // and WebKitGTK can acknowledge an accessibility write without
-        // producing the renderer input event, so web embedders use real XTest
+        // Foreground means the caller explicitly permits activation. Chromium,
+        // WebKitGTK, and Gecko (Firefox) can acknowledge an accessibility write
+        // without producing a real field update, so browsers use real XTest
         // key events. Native toolkits keep their verifiable AT-SPI path below.
-        if delivery.is_foreground() && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid)) {
+        if delivery.is_foreground() && is_browser_embedder(pid) {
             if let Some(idx) = resolved_elem_idx {
                 let focused =
                     tokio::task::spawn_blocking(move || crate::atspi::focus_element(pid, idx))
@@ -3663,6 +3746,11 @@ impl Tool for SetValueTool {
             tokio::task::spawn_blocking(move || crate::atspi::set_value(pid, idx, &value_for_task))
                 .await;
         match result {
+            Ok(Ok(())) if is_browser_embedder(pid) => ToolResult::text(format!(
+                "Set value of element [{idx}] to '{value}' via AT-SPI (unverified on browser). \
+                 Browser chrome/page fields often ignore SetValue — verify via screenshot; \
+                 prefer type_text with delivery_mode=foreground (real key events) after focusing the field."
+            )),
             Ok(Ok(())) => ToolResult::text(format!("Set value of element [{idx}] to '{value}'.")),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -4203,10 +4291,13 @@ impl Tool for DoubleClickTool {
             None => return ToolResult::error("Provide either element_index or window_id + x/y."),
         };
         let from_zoom = args.bool_or("from_zoom", false);
-        let mut x = args.f64_or("x", 0.0);
-        let mut y = args.f64_or("y", 0.0);
+        let image_x = args.f64_or("x", 0.0);
+        let image_y = args.f64_or("y", 0.0);
+        let mut x = image_x;
+        let mut y = image_y;
+        let mut resize_ratio = 1.0_f64;
         if from_zoom {
-            match self.state.zoom_registry.get(pid) {
+            match self.state.zoom_registry.get(pid, xid) {
                 Some(ctx) => {
                     let (wx, wy) = ctx.zoom_to_window(x, y);
                     x = wx;
@@ -4218,7 +4309,8 @@ impl Tool for DoubleClickTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
+            resize_ratio = ratio;
             x *= ratio;
             y *= ratio;
         }
@@ -4287,10 +4379,32 @@ impl Tool for DoubleClickTool {
             "background"
         };
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
-                "✅ Double-clicked at ({x:.1}, {y:.1}) (delivery_mode={mode_label})."
-            ))
-            .with_structured(json!({ "verified": false, "delivery_mode": mode_label })),
+            Ok(Ok(())) => {
+                let screen = glide_target
+                    .map(|(sx, sy)| format!(" screen=({sx:.1},{sy:.1})"))
+                    .unwrap_or_default();
+                let ratio_note = if (resize_ratio - 1.0).abs() > 1e-6 {
+                    format!(" resize_ratio={resize_ratio:.4}")
+                } else {
+                    String::new()
+                };
+                ToolResult::text(format!(
+                    "Sent double-click input (delivery_mode={mode_label}). \
+                     image=({image_x:.1},{image_y:.1}) → window_local=({x:.1},{y:.1}){screen}{ratio_note}. \
+                     Effect unverified — confirm via the post-action screenshot before the next mutation."
+                ))
+                .with_structured(json!({
+                    "verified": false,
+                    "delivery_mode": mode_label,
+                    "image_x": image_x,
+                    "image_y": image_y,
+                    "window_local_x": x,
+                    "window_local_y": y,
+                    "resize_ratio": resize_ratio,
+                    "screen_x": glide_target.map(|(sx, _)| sx),
+                    "screen_y": glide_target.map(|(_, sy)| sy),
+                }))
+            }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -4435,10 +4549,13 @@ impl Tool for RightClickTool {
             None => return ToolResult::error("Provide either element_index or window_id + x/y."),
         };
         let from_zoom = args.bool_or("from_zoom", false);
-        let mut x = args.f64_or("x", 0.0);
-        let mut y = args.f64_or("y", 0.0);
+        let image_x = args.f64_or("x", 0.0);
+        let image_y = args.f64_or("y", 0.0);
+        let mut x = image_x;
+        let mut y = image_y;
+        let mut resize_ratio = 1.0_f64;
         if from_zoom {
-            match self.state.zoom_registry.get(pid) {
+            match self.state.zoom_registry.get(pid, xid) {
                 Some(ctx) => {
                     let (wx, wy) = ctx.zoom_to_window(x, y);
                     x = wx;
@@ -4450,7 +4567,8 @@ impl Tool for RightClickTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
+            resize_ratio = ratio;
             x *= ratio;
             y *= ratio;
         }
@@ -4518,10 +4636,32 @@ impl Tool for RightClickTool {
             "background"
         };
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
-                "✅ Right-clicked at ({x:.1}, {y:.1}) (delivery_mode={mode_label})."
-            ))
-            .with_structured(json!({ "verified": false, "delivery_mode": mode_label })),
+            Ok(Ok(())) => {
+                let screen = glide_target
+                    .map(|(sx, sy)| format!(" screen=({sx:.1},{sy:.1})"))
+                    .unwrap_or_default();
+                let ratio_note = if (resize_ratio - 1.0).abs() > 1e-6 {
+                    format!(" resize_ratio={resize_ratio:.4}")
+                } else {
+                    String::new()
+                };
+                ToolResult::text(format!(
+                    "Sent right-click input (delivery_mode={mode_label}). \
+                     image=({image_x:.1},{image_y:.1}) → window_local=({x:.1},{y:.1}){screen}{ratio_note}. \
+                     Effect unverified — confirm via the post-action screenshot before the next mutation."
+                ))
+                .with_structured(json!({
+                    "verified": false,
+                    "delivery_mode": mode_label,
+                    "image_x": image_x,
+                    "image_y": image_y,
+                    "window_local_x": x,
+                    "window_local_y": y,
+                    "resize_ratio": resize_ratio,
+                    "screen_x": glide_target.map(|(sx, _)| sx),
+                    "screen_y": glide_target.map(|(_, sy)| sy),
+                }))
+            }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -4671,7 +4811,7 @@ impl Tool for DragTool {
         let from_zoom = args.bool_or("from_zoom", false);
 
         if from_zoom {
-            match self.state.zoom_registry.get(pid) {
+            match self.state.zoom_registry.get(pid, xid) {
                 Some(ctx) => {
                     let (wx, wy) = ctx.zoom_to_window(from_x, from_y);
                     let (wx2, wy2) = ctx.zoom_to_window(to_x, to_y);
@@ -4686,7 +4826,7 @@ impl Tool for DragTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
             from_x *= ratio;
             from_y *= ratio;
             to_x *= ratio;
@@ -5005,7 +5145,7 @@ impl Tool for MouseButtonDownTool {
         let mut x = args.f64_or("x", 0.0);
         let mut y = args.f64_or("y", 0.0);
         if args.bool_or("from_zoom", false) {
-            match self.state.zoom_registry.get(pid) {
+            match self.state.zoom_registry.get(pid, xid) {
                 Some(ctx) => {
                     let (wx, wy) = ctx.zoom_to_window(x, y);
                     x = wx;
@@ -5017,7 +5157,7 @@ impl Tool for MouseButtonDownTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, xid) {
             x *= ratio;
             y *= ratio;
         }
@@ -5147,7 +5287,7 @@ impl Tool for MouseDragTool {
         let mut to_x = args.f64_or("x", 0.0);
         let mut to_y = args.f64_or("y", 0.0);
         if args.bool_or("from_zoom", false) {
-            match self.state.zoom_registry.get(hold.pid) {
+            match self.state.zoom_registry.get(hold.pid, hold.xid) {
                 Some(ctx) => {
                     let (wx, wy) = ctx.zoom_to_window(to_x, to_y);
                     to_x = wx;
@@ -5161,7 +5301,7 @@ impl Tool for MouseDragTool {
                     .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(hold.pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(hold.pid, hold.xid) {
             to_x *= ratio;
             to_y *= ratio;
         }
@@ -5351,7 +5491,7 @@ impl Tool for MouseButtonUpTool {
         let mut x = args.opt_f64("x").unwrap_or(hold.x);
         let mut y = args.opt_f64("y").unwrap_or(hold.y);
         if args.bool_or("from_zoom", false) {
-            match self.state.zoom_registry.get(hold.pid) {
+            match self.state.zoom_registry.get(hold.pid, hold.xid) {
                 Some(ctx) => {
                     let (wx, wy) = ctx.zoom_to_window(x, y);
                     x = wx;
@@ -5365,7 +5505,7 @@ impl Tool for MouseButtonUpTool {
                     .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(hold.pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(hold.pid, hold.xid) {
             x *= ratio;
             y *= ratio;
         }
@@ -6743,6 +6883,248 @@ impl Tool for SetConfigTool {
     }
 }
 
+// ── find_elements ─────────────────────────────────────────────────────────────
+
+/// Search a window's AT-SPI tree without dumping every node into the prompt.
+///
+/// Walks the full tree (no prefix cap), ranks matches by label/role/value/
+/// description/actions, and returns a bounded hit list with element_token +
+/// frame. Prefer this over get_window_state when looking for a named control.
+pub struct FindElementsTool;
+
+static FIND_ELEMENTS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+#[async_trait]
+impl Tool for FindElementsTool {
+    fn def(&self) -> &ToolDef {
+        FIND_ELEMENTS_DEF.get_or_init(|| ToolDef {
+            name: "find_elements".into(),
+            description: "Search a window's accessibility tree for controls matching a query. \
+                Returns a ranked, bounded list of hits with element_index, element_token, \
+                role, label, frame, and actions — without dumping the full tree. \
+                Prefer this over get_window_state when looking for a named control \
+                (button, field, heading, menu item). Call get_window_state only when you \
+                need a fresh screenshot or a full structural overview.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["pid", "window_id", "query"],
+                "properties": {
+                    "session": cua_driver_core::tool_schema::session_schema(),
+                    "pid": {"type": "integer"},
+                    "window_id": {"type": "integer", "description": "X11 XID / window id from list_windows."},
+                    "query": {
+                        "type": "string",
+                        "description": "Case-insensitive substring matched against role, name/label, value, description, and actions."
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Optional role filter (e.g. button, text, heading, menu item). Case-insensitive substring."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Max hits to return (default 12, hard cap 40)."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        use cua_driver_core::tool_args::ArgsExt;
+        let pid = match args.require_u32("pid") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let xid = match args.require_u64("window_id") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let query = match args.require_str("query") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if query.trim().is_empty() {
+            return ToolResult::error("find_elements: query must be non-empty");
+        }
+        let role_filter = args.opt_str("role");
+        let max_results = args
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).clamp(1, 40))
+            .unwrap_or(12);
+
+        let query_owned = query.clone();
+        let role_owned = role_filter.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            // Full walk — no max_elements prefix. Search must see deep nodes
+            // that a capped get_window_state dump would drop.
+            crate::atspi::walk_tree_bounded(pid, xid, None, None, None)
+        })
+        .await;
+
+        let tree = match result {
+            Ok(t) => t,
+            Err(e) => return ToolResult::error(format!("find_elements task error: {e}")),
+        };
+
+        let needle = query_owned.to_lowercase();
+        let role_needle = role_owned.map(|r| r.to_lowercase());
+
+        // Build parent map for ancestor paths.
+        let mut by_idx: std::collections::HashMap<usize, &crate::atspi::AtspiNode> =
+            std::collections::HashMap::new();
+        for n in &tree.nodes {
+            if let Some(i) = n.element_index {
+                by_idx.insert(i, n);
+            }
+        }
+        let bounds_by_idx: std::collections::HashMap<usize, (i32, i32, u32, u32)> = tree
+            .bounds
+            .iter()
+            .copied()
+            .map(|(i, x, y, w, h)| (i, (x, y, w, h)))
+            .collect();
+
+        let snapshot_id = cua_driver_core::element_token::global().register_snapshot(
+            pid as i32,
+            xid as u32,
+            by_idx.len(),
+        );
+
+        let mut scored: Vec<(i32, usize, &crate::atspi::AtspiNode)> = Vec::new();
+        for n in &tree.nodes {
+            let Some(idx) = n.element_index else {
+                continue;
+            };
+            if let Some(ref rn) = role_needle {
+                if !n.role.to_lowercase().contains(rn) {
+                    continue;
+                }
+            }
+            let label = n
+                .name
+                .clone()
+                .or_else(|| n.value.clone())
+                .or_else(|| n.description.clone())
+                .unwrap_or_default();
+            let hay = format!(
+                "{} {} {} {} {}",
+                n.role,
+                label,
+                n.value.as_deref().unwrap_or(""),
+                n.description.as_deref().unwrap_or(""),
+                n.actions.join(" ")
+            )
+            .to_lowercase();
+            if !hay.contains(&needle) {
+                continue;
+            }
+            // Rank: exact label match > label prefix > role+label > other.
+            let label_l = label.to_lowercase();
+            let score = if label_l == needle {
+                100
+            } else if label_l.starts_with(&needle) {
+                80
+            } else if label_l.contains(&needle) {
+                60
+            } else if n.role.to_lowercase().contains(&needle) {
+                40
+            } else {
+                20
+            };
+            scored.push((score, idx, n));
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.truncate(max_results);
+
+        let mut hits = Vec::with_capacity(scored.len());
+        let mut lines = Vec::with_capacity(scored.len() + 2);
+        lines.push(format!(
+            "find_elements pid={pid} window_id={xid} query={query_owned:?} matches={}/{}",
+            scored.len(),
+            by_idx.len()
+        ));
+        if scored.is_empty() {
+            lines.push("No matches. Try a shorter query, drop role filter, or get_window_state for a screenshot.".into());
+        }
+        for (score, idx, n) in &scored {
+            let label = n
+                .name
+                .clone()
+                .or_else(|| n.value.clone())
+                .or_else(|| n.description.clone());
+            let token = cua_driver_core::element_token::token_for(snapshot_id, *idx);
+            let frame = bounds_by_idx.get(idx).map(|(x, y, w, h)| {
+                json!({ "x": x, "y": y, "w": w, "h": h })
+            });
+            // Short ancestor path (up to 4 parents).
+            let mut path = Vec::new();
+            let mut cur = n.parent_element_index;
+            for _ in 0..4 {
+                let Some(pidx) = cur else { break };
+                let Some(pn) = by_idx.get(&pidx) else { break };
+                let plabel = pn
+                    .name
+                    .as_deref()
+                    .or(pn.value.as_deref())
+                    .unwrap_or("");
+                path.push(format!(
+                    "{}{}",
+                    pn.role,
+                    if plabel.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {plabel:?}")
+                    }
+                ));
+                cur = pn.parent_element_index;
+            }
+            path.reverse();
+            let path_s = path.join(" > ");
+            lines.push(format!(
+                "- [{idx}] {} {:?} actions={:?} score={score} path={path_s}",
+                n.role,
+                label.as_deref().unwrap_or(""),
+                n.actions
+            ));
+            let mut entry = json!({
+                "element_index": idx,
+                "element_token": token,
+                "role": n.role,
+                "score": score,
+                "actions": n.actions,
+                "ancestor_path": path_s,
+            });
+            if let Some(l) = label {
+                entry["label"] = json!(l);
+            }
+            if let Some(f) = frame {
+                entry["frame"] = f;
+            }
+            hits.push(entry);
+        }
+
+        ToolResult::text(lines.join("\n")).with_structured(json!({
+            "pid": pid,
+            "window_id": xid,
+            "query": query_owned,
+            "element_count": by_idx.len(),
+            "match_count": hits.len(),
+            "snapshot_id": cua_driver_core::element_token::token_for(snapshot_id, 0)
+                .trim_end_matches(":0")
+                .to_string(),
+            "hits": hits,
+            "_note": "Use element_token/element_index from hits for click/type_text. Re-run find_elements after UI changes — tokens are snapshot-scoped."
+        }))
+    }
+}
+
 // ── get_accessibility_tree ────────────────────────────────────────────────────
 
 pub struct GetAccessibilityTreeTool;
@@ -6890,6 +7272,7 @@ impl Tool for ZoomTool {
                 if let Some(p) = pid {
                     state.zoom_registry.set(
                         p,
+                        xid,
                         ZoomContext {
                             origin_x: crop.origin_x,
                             origin_y: crop.origin_y,
@@ -7221,6 +7604,7 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
     r.register(Box::new(GetWindowStateTool {
         state: state.clone(),
     }));
+    r.register(Box::new(FindElementsTool));
     r.register(Box::new(LaunchAppTool));
     r.register(Box::new(KillAppTool));
     r.register(Box::new(BringToFrontTool));
